@@ -153,18 +153,24 @@ def color_tab_done(wb, sheet_name):
     wb[sheet_name].sheet_properties.tabColor = Color(rgb="FF00B050")
 
 
+def strip_tables(wb):
+    """Remove Excel table definitions to prevent openpyxl save corruption."""
+    for ws in wb.worksheets:
+        ws.tables.clear()
+
+
 # ── Strategy Report ───────────────────────────────────────────────────────────
 
 STRATEGY_SHEETS = ["WKONE", "WKTWO", "WKTHREE", "WKFOUR", "WKFIVE"]
 
 # openpyxl col index → (header label, CSV col index)
 STRATEGY_COLS = {
-    4:  ("OTB TY Trans RMS", 1),
-    9:  ("GRP PU TY",        7),
-    14: ("GRP N/PU TY",      8),
-    21: ("OOO RMS",          4),
-    35: ("Trans Rev TY",    16),
-    43: ("Grp Rev TY",       9),
+    4:  ("OTB TY Trans (Indiv Count)", 15),
+    9:  ("GRP PU TY",                   7),
+    14: ("GRP N/PU TY",                 8),
+    21: ("OOO RMS",                     4),
+    35: ("Trans Rev TY",               16),
+    43: ("Grp Rev TY",                  9),
 }
 
 
@@ -218,6 +224,75 @@ def apply_strategy_changes(wb, sheet_name, changes):
         if ch["skip_reason"]:
             continue
         ws.cell(ch["row"], ch["col"]).value = ch["new_value"]
+
+
+def parse_rate_csv(file_bytes: bytes) -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(file_bytes), dtype=str, encoding="utf-8-sig")
+    df.columns = [c.strip() for c in df.columns]
+    return df
+
+
+def find_header_col(ws, keyword, header_rows=(2, 3, 4)):
+    """Find the leftmost column whose concatenated header text (rows 2-4) contains keyword."""
+    keyword = keyword.strip().lower()
+    col_texts = {}
+    for row_num in header_rows:
+        for cell in ws[row_num]:
+            col = cell.column
+            if col not in col_texts:
+                col_texts[col] = ""
+            if isinstance(cell.value, str):
+                col_texts[col] += cell.value.strip()
+    matches = [col for col, text in col_texts.items() if keyword in text.lower()]
+    return min(matches) if matches else None
+
+
+def build_rates_change_plan(rate_df, wb, sheet_name):
+    today = datetime.date.today()
+    scope_start = today.replace(day=1)
+    scope_end = datetime.date(today.year, 12, 31)
+
+    date_row_map = build_date_row_map(wb)
+    ws = wb[sheet_name]
+
+    restric_col = find_header_col(ws, "restric")
+    hotel_col   = (restric_col + 1) if restric_col else None
+
+    changes = []
+    warnings = []
+    if not restric_col:
+        warnings.append("Could not find Restrictions column in sheet headers.")
+
+    for _, row in rate_df.iterrows():
+        date_str = str(row.get("Date", "")).strip()
+        d = None
+        for fmt in ("%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d"):
+            try:
+                d = datetime.datetime.strptime(date_str, fmt).date()
+                break
+            except ValueError:
+                continue
+        if d is None:
+            continue
+        if d < scope_start or d > scope_end:
+            continue
+        if d not in date_row_map:
+            continue
+
+        excel_row  = date_row_map[d]
+        double_val = safe_float(row.get("Double", ""))
+        mlos_val   = safe_float(row.get("Min Length of Stay", ""))
+
+        if hotel_col:
+            skip = "formula" if is_formula(ws.cell(excel_row, hotel_col).value) else None
+            changes.append({"date": d, "row": excel_row, "col": hotel_col,
+                            "label": "Hotel Rate", "new_value": double_val, "skip_reason": skip})
+        if restric_col:
+            skip = "formula" if is_formula(ws.cell(excel_row, restric_col).value) else None
+            changes.append({"date": d, "row": excel_row, "col": restric_col,
+                            "label": "Restrictions (MLOS)", "new_value": mlos_val, "skip_reason": skip})
+
+    return changes, warnings
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -290,6 +365,7 @@ with tab_rob:
                 wb2 = openpyxl.load_workbook(io.BytesIO(st.session_state["rob_wb_bytes"]), data_only=False)
                 apply_rob_changes(wb2, st.session_state["rob_sheet_sel"], changes)
                 color_tab_done(wb2, st.session_state["rob_sheet_sel"])
+                strip_tables(wb2)
                 out = io.BytesIO()
                 wb2.save(out)
                 st.download_button(
@@ -302,28 +378,50 @@ with tab_rob:
 # ── Tab 2: Strategy ───────────────────────────────────────────────────────────
 with tab_strategy:
     st.header("Strategy Report Update")
-    csv_file2 = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="str_csv")
-    xl_file2  = st.file_uploader("Upload Strategy Report Workbook (.xlsx)", type=["xlsx"], key="str_xl")
 
-    if csv_file2 and xl_file2:
-        csv_bytes2 = csv_file2.read()
-        xl_bytes2  = xl_file2.read()
+    col_a, col_b = st.columns(2)
+    with col_a:
+        csv_file2 = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="str_csv")
+    with col_b:
+        rate_file2 = st.file_uploader("Upload Rates & Restrictions CSV", type=["csv"], key="str_rate")
 
-        df2 = parse_csv(csv_bytes2)
-        wb2 = openpyxl.load_workbook(io.BytesIO(xl_bytes2), data_only=False)
+    col_c, col_d = st.columns(2)
+    with col_c:
+        xl_file2 = st.file_uploader("Upload Strategy Report Workbook (.xlsx)", type=["xlsx"], key="str_xl")
 
-        auto_sheet2 = first_uncolored_sheet(wb2, STRATEGY_SHEETS)
+    if xl_file2:
+        xl_bytes2 = xl_file2.read()
+        wb2_peek  = openpyxl.load_workbook(io.BytesIO(xl_bytes2), data_only=False)
+
+        auto_sheet2   = first_uncolored_sheet(wb2_peek, STRATEGY_SHEETS)
         sheet_choice2 = st.selectbox("Week tab", STRATEGY_SHEETS,
                                      index=STRATEGY_SHEETS.index(auto_sheet2), key="str_sheet")
         st.caption(f"Auto-detected next tab: **{auto_sheet2}**")
 
-        if st.button("Preview Changes", key="str_preview"):
-            changes2 = build_strategy_change_plan(df2, wb2, sheet_choice2)
-            st.session_state["str_changes"]  = changes2
-            st.session_state["str_wb_bytes"] = xl_bytes2
+        if (csv_file2 or rate_file2) and st.button("Preview Changes", key="str_preview"):
+            wb2_full = openpyxl.load_workbook(io.BytesIO(xl_bytes2), data_only=False)
+            all_changes = []
+
+            if csv_file2:
+                df2 = parse_csv(csv_file2.read())
+                all_changes += build_strategy_change_plan(df2, wb2_full, sheet_choice2)
+
+            rate_warnings = []
+            if rate_file2:
+                rate_df = parse_rate_csv(rate_file2.read())
+                rate_changes, rate_warnings = build_rates_change_plan(
+                    rate_df, wb2_full, sheet_choice2)
+                all_changes += rate_changes
+
+            st.session_state["str_changes"]   = all_changes
+            st.session_state["str_wb_bytes"]  = xl_bytes2
             st.session_state["str_sheet_sel"] = sheet_choice2
+            st.session_state["str_warnings"]  = rate_warnings
 
         if "str_changes" in st.session_state:
+            for w in st.session_state.get("str_warnings", []):
+                st.warning(w)
+
             changes2    = st.session_state["str_changes"]
             will_write2 = [c for c in changes2 if not c["skip_reason"]]
             skipped2    = [c for c in changes2 if c["skip_reason"]]
@@ -349,6 +447,7 @@ with tab_strategy:
                 wb3 = openpyxl.load_workbook(io.BytesIO(st.session_state["str_wb_bytes"]), data_only=False)
                 apply_strategy_changes(wb3, st.session_state["str_sheet_sel"], changes2)
                 color_tab_done(wb3, st.session_state["str_sheet_sel"])
+                strip_tables(wb3)
                 out2 = io.BytesIO()
                 wb3.save(out2)
                 st.download_button(
