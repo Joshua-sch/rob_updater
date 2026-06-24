@@ -103,19 +103,25 @@ def build_rob_change_plan(df, ws):
         sec_col = find_secondary_col(ws, block_start)
 
         entries = [
-            (block_start + 1, 5, "Revenue",        rev),
-            (block_start + 2, 5, "Room Nights",     rms),
-            (block_start + 4, 5, "Group Rms Sold",  grp_sold),
-            (block_start + 5, 5, "Group Rm Rev",    grp_rvn),
+            (block_start + 1, 5, "Revenue",        rev,       False),
+            (block_start + 2, 5, "Room Nights",     rms,       False),
+            (block_start + 4, 5, "Group Rms Sold",  grp_sold,  False),
+            (block_start + 5, 5, "Group Rm Rev",    grp_rvn,   False),
         ]
         if sec_col:
-            entries.append((block_start + 4, sec_col, "Group Not P/U (Variance)", grp_npu))
+            from openpyxl.utils import get_column_letter
+            sec_letter = get_column_letter(sec_col)
+            npu_row    = block_start + 4
+            adr_row    = block_start + 6
+            npu_formula = f"={sec_letter}{npu_row}*E{adr_row}"
+            entries.append((npu_row,     sec_col, "Group Not P/U rooms",    grp_npu,     False))
+            entries.append((npu_row + 1, sec_col, "Group Not P/U rev (formula)", npu_formula, True))
 
-        for r, c, label, val in entries:
+        for r, c, label, val, is_formula_write in entries:
             skip = None
             if r >= 100:
                 skip = "row≥100"
-            elif is_formula(ws.cell(r, c).value):
+            elif not is_formula_write and is_formula(ws.cell(r, c).value):
                 skip = "formula"
             changes.append({"row": r, "col": c, "label": label, "month": month,
                              "new_value": val, "skip_reason": skip})
@@ -129,6 +135,22 @@ def apply_rob_changes(wb, sheet_name, changes):
         if ch["skip_reason"]:
             continue
         ws.cell(ch["row"], ch["col"]).value = ch["new_value"]
+
+
+def first_uncolored_sheet(wb, sheet_names):
+    """Return the first sheet in sheet_names whose tab has no color set."""
+    for name in sheet_names:
+        ws = wb[name]
+        tc = ws.sheet_properties.tabColor
+        if tc is None:
+            return name
+    return sheet_names[-1]  # fallback: last sheet
+
+
+def color_tab_done(wb, sheet_name):
+    """Mark a sheet tab green to indicate it has been completed."""
+    from openpyxl.styles.colors import Color
+    wb[sheet_name].sheet_properties.tabColor = Color(rgb="FF00B050")
 
 
 # ── Strategy Report ───────────────────────────────────────────────────────────
@@ -223,7 +245,6 @@ with tab_rob:
     st.header("ROB Master Workbook Update")
     csv_file = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="rob_csv")
     xl_file  = st.file_uploader("Upload ROB Master Workbook (.xlsx)", type=["xlsx"], key="rob_xl")
-    sheet_choice = st.selectbox("Week tab", ROB_SHEETS, key="rob_sheet")
 
     if csv_file and xl_file:
         csv_bytes = csv_file.read()
@@ -232,11 +253,16 @@ with tab_rob:
         df = parse_csv(csv_bytes)
         wb = openpyxl.load_workbook(io.BytesIO(xl_bytes), data_only=False)
 
+        auto_sheet = first_uncolored_sheet(wb, ROB_SHEETS)
+        sheet_choice = st.selectbox("Week tab", ROB_SHEETS,
+                                    index=ROB_SHEETS.index(auto_sheet), key="rob_sheet")
+        st.caption(f"Auto-detected next tab: **{auto_sheet}**")
+
         if st.button("Preview Changes", key="rob_preview"):
             ws = wb[sheet_choice]
             changes = build_rob_change_plan(df, ws)
-            st.session_state["rob_changes"]  = changes
-            st.session_state["rob_wb_bytes"] = xl_bytes
+            st.session_state["rob_changes"]   = changes
+            st.session_state["rob_wb_bytes"]  = xl_bytes
             st.session_state["rob_sheet_sel"] = sheet_choice
 
         if "rob_changes" in st.session_state:
@@ -263,6 +289,7 @@ with tab_rob:
             if st.button("Confirm and Apply Changes", key="rob_apply"):
                 wb2 = openpyxl.load_workbook(io.BytesIO(st.session_state["rob_wb_bytes"]), data_only=False)
                 apply_rob_changes(wb2, st.session_state["rob_sheet_sel"], changes)
+                color_tab_done(wb2, st.session_state["rob_sheet_sel"])
                 out = io.BytesIO()
                 wb2.save(out)
                 st.download_button(
@@ -277,7 +304,6 @@ with tab_strategy:
     st.header("Strategy Report Update")
     csv_file2 = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="str_csv")
     xl_file2  = st.file_uploader("Upload Strategy Report Workbook (.xlsx)", type=["xlsx"], key="str_xl")
-    sheet_choice2 = st.selectbox("Week tab", STRATEGY_SHEETS, index=3, key="str_sheet")  # default WKFOUR
 
     if csv_file2 and xl_file2:
         csv_bytes2 = csv_file2.read()
@@ -285,6 +311,11 @@ with tab_strategy:
 
         df2 = parse_csv(csv_bytes2)
         wb2 = openpyxl.load_workbook(io.BytesIO(xl_bytes2), data_only=False)
+
+        auto_sheet2 = first_uncolored_sheet(wb2, STRATEGY_SHEETS)
+        sheet_choice2 = st.selectbox("Week tab", STRATEGY_SHEETS,
+                                     index=STRATEGY_SHEETS.index(auto_sheet2), key="str_sheet")
+        st.caption(f"Auto-detected next tab: **{auto_sheet2}**")
 
         if st.button("Preview Changes", key="str_preview"):
             changes2 = build_strategy_change_plan(df2, wb2, sheet_choice2)
@@ -317,6 +348,7 @@ with tab_strategy:
             if st.button("Confirm and Apply Changes", key="str_apply"):
                 wb3 = openpyxl.load_workbook(io.BytesIO(st.session_state["str_wb_bytes"]), data_only=False)
                 apply_strategy_changes(wb3, st.session_state["str_sheet_sel"], changes2)
+                color_tab_done(wb3, st.session_state["str_sheet_sel"])
                 out2 = io.BytesIO()
                 wb3.save(out2)
                 st.download_button(
