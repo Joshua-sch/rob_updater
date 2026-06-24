@@ -4,6 +4,9 @@ import openpyxl
 import io
 import re
 import datetime
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 # ── CSV parsing ───────────────────────────────────────────────────────────────
 
@@ -568,6 +571,106 @@ def apply_forecast_changes(wb, sheet_name, changes):
         ws.cell(ch["row"], ch["col"]).value = ch["new_value"]
 
 
+# ── Google Drive ──────────────────────────────────────────────────────────────
+
+HOTELS = ["Plymouth"]
+
+# Maps hotel name → keyword to match against Drive folder names (case-insensitive)
+HOTEL_FOLDER_KEYWORDS = {
+    "Plymouth": "Plymouth - TEST",
+}
+
+WORKBOOK_TYPES = ["ROB", "Strategy Report", "Forecast"]
+
+# Maps workbook type → partial filename keyword to search for in Drive
+WORKBOOK_KEYWORDS = {
+    "ROB":             "ROB",
+    "Strategy Report": "STRATEGY",
+    "Forecast":        "FORECAST",
+}
+
+CREDS_PATH = "credentials.json.json"
+SCOPES     = ["https://www.googleapis.com/auth/drive"]
+
+
+@st.cache_resource
+def get_drive_service():
+    creds = service_account.Credentials.from_service_account_file(CREDS_PATH, scopes=SCOPES)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def drive_find_folder_by_keyword(service, keyword, parent_id=None):
+    """Return the first folder whose name contains keyword (case-insensitive)."""
+    q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    if parent_id:
+        q += " and '%s' in parents" % parent_id
+    result = service.files().list(q=q, fields="files(id, name)", pageSize=100).execute()
+    for f in result.get("files", []):
+        if keyword.lower() in f["name"].lower():
+            return f["id"], f["name"]
+    return None, None
+
+
+def drive_find_file(service, keyword, parent_id):
+    """Return (file_id, file_name) for first xlsx whose name contains keyword,
+    excluding files whose name also contains 'copy' (to skip backup copies)."""
+    q = ("'%s' in parents and trashed = false "
+         "and mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'") % parent_id
+    result = service.files().list(q=q, fields="files(id, name)").execute()
+    for f in result.get("files", []):
+        name_lower = f["name"].lower()
+        if keyword.lower() in name_lower and "copy" not in name_lower:
+            return f["id"], f["name"]
+    return None, None
+
+
+def drive_download(service, file_id) -> bytes:
+    buf = io.BytesIO()
+    req = service.files().get_media(fileId=file_id)
+    dl  = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+    return buf.getvalue()
+
+
+def drive_upload(service, file_id, file_bytes: bytes, file_name: str):
+    """Overwrite an existing Drive file with new bytes."""
+    buf   = io.BytesIO(file_bytes)
+    media = MediaIoBaseUpload(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        resumable=True,
+    )
+    service.files().update(fileId=file_id, media_body=media).execute()
+
+
+def resolve_drive_workbook(service, hotel: str, workbook_type: str):
+    """
+    Walk Drive: hotel folder (keyword match) → month folder (YYYYMMm keyword) → file.
+    Returns ((file_id, file_name), None) or (None, error_message).
+    """
+    today      = datetime.date.today()
+    # Month keyword: e.g. "JUN2026" matches "F: JUN2026 REVENUE REPORTS PLYMOUTH"
+    month_kw   = today.strftime("%b%Y").upper()          # e.g. "JUN2026"
+    hotel_kw   = HOTEL_FOLDER_KEYWORDS[hotel]
+    wb_keyword = WORKBOOK_KEYWORDS[workbook_type]
+
+    hotel_id, hotel_name = drive_find_folder_by_keyword(service, hotel_kw)
+    if not hotel_id:
+        return None, f"No folder containing '{hotel_kw}' found in Drive."
+
+    month_id, month_name = drive_find_folder_by_keyword(service, month_kw, parent_id=hotel_id)
+    if not month_id:
+        return None, f"No folder containing '{month_kw}' found under '{hotel_name}'."
+
+    file_id, file_name = drive_find_file(service, wb_keyword, month_id)
+    if not file_id:
+        return None, f"No '{wb_keyword}' workbook found in '{month_name}'."
+
+    return (file_id, file_name), None
+
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Linchris Weekly Tools", layout="wide")
@@ -584,282 +687,431 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Linchris Hotel Corporation — Weekly Update Tools")
+title_col, toggle_col = st.columns([6, 1])
+with title_col:
+    st.title("Linchris Hotel Corporation — Weekly Update Tools")
+with toggle_col:
+    st.write("")
+    test_mode = st.toggle("Test Mode", value=False, key="test_mode")
 
-tab_rob, tab_strategy, tab_forecast = st.tabs(["ROB Update", "Strategy Report", "Forecast"])
-
-# ── Tab 1: ROB ────────────────────────────────────────────────────────────────
-with tab_rob:
-    st.header("ROB Master Workbook Update")
-    csv_file = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="rob_csv")
-    xl_file  = st.file_uploader("Upload ROB Master Workbook (.xlsx)", type=["xlsx"], key="rob_xl")
-
-    if csv_file and xl_file:
-        csv_bytes = csv_file.read()
-        xl_bytes  = xl_file.read()
-
-        df = parse_csv(csv_bytes)
-        wb = openpyxl.load_workbook(io.BytesIO(xl_bytes), data_only=False)
-
-        auto_sheet = first_uncolored_sheet(wb, ROB_SHEETS)
-        sheet_choice = st.selectbox("Week tab", ROB_SHEETS,
-                                    index=ROB_SHEETS.index(auto_sheet), key="rob_sheet")
-        st.caption(f"Auto-detected next tab: **{auto_sheet}**")
-
-        if st.button("Preview Changes", key="rob_preview"):
-            ws = wb[sheet_choice]
-            changes = build_rob_change_plan(df, ws)
-            st.session_state["rob_changes"]   = changes
-            st.session_state["rob_wb_bytes"]  = xl_bytes
-            st.session_state["rob_sheet_sel"] = sheet_choice
-
-        if "rob_changes" in st.session_state:
-            changes    = st.session_state["rob_changes"]
-            will_write = [c for c in changes if not c["skip_reason"]]
-            skipped    = [c for c in changes if c["skip_reason"]]
-
-            c1, c2 = st.columns(2)
-            c1.metric("Cells to update", len(will_write))
-            c2.metric("Skipped",         len(skipped))
-
-            preview_rows = []
-            for c in changes:
-                preview_rows.append({
-                    "Month":  c["month"] or "—",
-                    "Label":  c["label"],
-                    "Row":    c["row"],
-                    "Col":    c["col"],
-                    "Value":  c["new_value"],
-                    "Status": "✅ will write" if not c["skip_reason"] else f"⚠️ skip ({c['skip_reason']})",
-                })
-            st.dataframe(preview_rows, use_container_width=True)
-
-            if st.button("Confirm and Apply Changes", key="rob_apply"):
-                wb2 = openpyxl.load_workbook(io.BytesIO(st.session_state["rob_wb_bytes"]), data_only=False)
-                apply_rob_changes(wb2, st.session_state["rob_sheet_sel"], changes)
-                color_tab_done(wb2, st.session_state["rob_sheet_sel"])
-                strip_tables(wb2)
-                out = io.BytesIO()
-                wb2.save(out)
-                st.download_button(
-                    "Download Updated ROB Workbook",
-                    data=out.getvalue(),
-                    file_name="ROB_Master_updated.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-
-# ── Tab 2: Strategy ───────────────────────────────────────────────────────────
-with tab_strategy:
-    st.header("Strategy Report Update")
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        csv_file2 = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="str_csv")
-    with col_b:
-        rate_file2 = st.file_uploader("Upload Rates & Restrictions CSV", type=["csv"], key="str_rate")
-
-    col_c, col_d = st.columns(2)
-    with col_c:
-        xl_file2 = st.file_uploader("Upload Strategy Report Workbook (.xlsx)", type=["xlsx"], key="str_xl")
-
-    if xl_file2:
-        xl_bytes2 = xl_file2.read()
-        wb2_peek  = openpyxl.load_workbook(io.BytesIO(xl_bytes2), data_only=False)
-
-        auto_sheet2   = first_uncolored_sheet(wb2_peek, STRATEGY_SHEETS)
-        sheet_choice2 = st.selectbox("Week tab", STRATEGY_SHEETS,
-                                     index=STRATEGY_SHEETS.index(auto_sheet2), key="str_sheet")
-        st.caption(f"Auto-detected next tab: **{auto_sheet2}**")
-
-        if (csv_file2 or rate_file2) and st.button("Preview Changes", key="str_preview"):
-            wb2_full = openpyxl.load_workbook(io.BytesIO(xl_bytes2), data_only=False)
-            all_changes = []
-
-            if csv_file2:
-                df2 = parse_csv(csv_file2.read())
-                all_changes += build_strategy_change_plan(df2, wb2_full, sheet_choice2)
-
-            rate_warnings = []
-            if rate_file2:
-                rate_df = parse_rate_csv(rate_file2.read())
-                rate_changes, rate_warnings = build_rates_change_plan(
-                    rate_df, wb2_full, sheet_choice2)
-                all_changes += rate_changes
-
-            st.session_state["str_changes"]   = all_changes
-            st.session_state["str_wb_bytes"]  = xl_bytes2
-            st.session_state["str_sheet_sel"] = sheet_choice2
-            st.session_state["str_warnings"]  = rate_warnings
-
-        if "str_changes" in st.session_state:
-            for w in st.session_state.get("str_warnings", []):
-                st.warning(w)
-
-            changes2    = st.session_state["str_changes"]
-            will_write2 = [c for c in changes2 if not c["skip_reason"]]
-            skipped2    = [c for c in changes2 if c["skip_reason"]]
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Cells to update", len(will_write2))
-            c2.metric("Skipped",         len(skipped2))
-            c3.metric("Days in scope",   len({c["date"] for c in changes2}))
-
-            preview_rows2 = []
-            for c in changes2:
-                preview_rows2.append({
-                    "Date":   str(c["date"]),
-                    "Label":  c["label"],
-                    "Row":    c["row"],
-                    "Col":    c["col"],
-                    "Value":  c["new_value"],
-                    "Status": "✅ will write" if not c["skip_reason"] else f"⚠️ skip ({c['skip_reason']})",
-                })
-            st.dataframe(preview_rows2, use_container_width=True)
-
-            if st.button("Confirm and Apply Changes", key="str_apply"):
-                wb3 = openpyxl.load_workbook(io.BytesIO(st.session_state["str_wb_bytes"]), data_only=False)
-                apply_strategy_changes(wb3, st.session_state["str_sheet_sel"], changes2)
-                color_tab_done(wb3, st.session_state["str_sheet_sel"])
-                strip_tables(wb3)
-                out2 = io.BytesIO()
-                wb3.save(out2)
-                st.download_button(
-                    "Download Updated Strategy Workbook",
-                    data=out2.getvalue(),
-                    file_name="Strategy_Report_updated.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-
-# ── Tab 3: Forecast ───────────────────────────────────────────────────────────
-with tab_forecast:
-    st.header("Forecast Update")
-
-    fcst_csv     = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="fcst_csv")
-    fcst_xl      = st.file_uploader("Upload Current Month Forecast Workbook (.xlsx)", type=["xlsx"], key="fcst_xl")
-    st.caption("Weeks 3 & 4 only: also upload next month's forecast workbook.")
-    fcst_xl_next = st.file_uploader("Upload Next Month Forecast Workbook (.xlsx)", type=["xlsx"], key="fcst_xl_next")
-
-    if fcst_xl:
-        fcst_bytes = fcst_xl.read()
-        wb_fcst_peek = openpyxl.load_workbook(io.BytesIO(fcst_bytes), data_only=False)
-
-        avail_fcst = [s for s in FORECAST_SHEETS if s in wb_fcst_peek.sheetnames]
-        auto_fcst  = first_uncolored_sheet(wb_fcst_peek, avail_fcst) if avail_fcst else None
-        fcst_sheet = st.selectbox("Week tab", avail_fcst,
-                                  index=avail_fcst.index(auto_fcst) if auto_fcst else 0,
-                                  key="fcst_sheet")
-        if auto_fcst:
-            st.caption(f"Auto-detected next tab: **{auto_fcst}**")
-
-        if fcst_xl_next:
-            fcst_next_bytes = fcst_xl_next.read()
-            wb_next_peek    = openpyxl.load_workbook(io.BytesIO(fcst_next_bytes), data_only=False)
-            avail_next      = [s for s in FORECAST_SHEETS if s in wb_next_peek.sheetnames]
-            auto_next       = first_uncolored_sheet(wb_next_peek, avail_next) if avail_next else None
-            fcst_sheet_next = st.selectbox("Next month week tab", avail_next,
-                                           index=avail_next.index(auto_next) if auto_next else 0,
-                                           key="fcst_sheet_next")
-            if auto_next:
-                st.caption(f"Auto-detected next month tab: **{auto_next}**")
-
-        if fcst_csv and st.button("Preview Changes", key="fcst_preview"):
-            csv_bytes = fcst_csv.read()
-
-            # Current month workbook
-            wb_fcst_full = openpyxl.load_workbook(io.BytesIO(fcst_bytes), data_only=False)
-            df_fcst = parse_csv(csv_bytes)
-            ws_fcst = wb_fcst_full[fcst_sheet]
-            fcst_changes, fcst_warnings = build_forecast_change_plan(df_fcst, ws_fcst)
-
-            st.session_state["fcst_changes"]   = fcst_changes
-            st.session_state["fcst_wb_bytes"]  = fcst_bytes
-            st.session_state["fcst_sheet_sel"] = fcst_sheet
-            st.session_state["fcst_warnings"]  = fcst_warnings
-
-            # Next month workbook (weeks 3 & 4)
-            if fcst_xl_next:
-                wb_next_full = openpyxl.load_workbook(io.BytesIO(fcst_next_bytes), data_only=False)
-                ws_next      = wb_next_full[fcst_sheet_next]
-                next_changes, next_warnings = build_next_month_forecast_plan(df_fcst, ws_next)
-                st.session_state["fcst_next_changes"]   = next_changes
-                st.session_state["fcst_next_wb_bytes"]  = fcst_next_bytes
-                st.session_state["fcst_next_sheet_sel"] = fcst_sheet_next
-                st.session_state["fcst_next_warnings"]  = next_warnings
-            else:
-                st.session_state.pop("fcst_next_changes", None)
-
-        if "fcst_changes" in st.session_state:
-            for w in st.session_state.get("fcst_warnings", []):
-                st.warning(w)
-
-            fcst_ch   = st.session_state["fcst_changes"]
-            will_fcst = [c for c in fcst_ch if not c["skip_reason"]]
-            skip_fcst = [c for c in fcst_ch if c["skip_reason"]]
-
-            st.subheader("Current month changes")
-            c1, c2 = st.columns(2)
-            c1.metric("Cells to update", len(will_fcst))
-            c2.metric("Skipped",         len(skip_fcst))
-
-            preview_fcst = []
-            for c in fcst_ch:
-                preview_fcst.append({
-                    "Label":  c["label"],
-                    "Row":    c["row"],
-                    "Col":    c["col"],
-                    "Value":  c["new_value"],
-                    "Status": "✅ will write" if not c["skip_reason"] else f"⚠️ skip ({c['skip_reason']})",
-                })
-            st.dataframe(preview_fcst, use_container_width=True)
-
-            if "fcst_next_changes" in st.session_state:
-                next_ch = st.session_state["fcst_next_changes"]
-                for w in st.session_state.get("fcst_next_warnings", []):
-                    st.warning(w)
-                will_next = [c for c in next_ch if not c["skip_reason"]]
-                skip_next = [c for c in next_ch if c["skip_reason"]]
-                st.subheader("Next month changes")
-                n1, n2 = st.columns(2)
-                n1.metric("Cells to update", len(will_next))
-                n2.metric("Skipped",         len(skip_next))
-                preview_next = []
-                for c in next_ch:
-                    preview_next.append({
+# ── Manual upload (collapsed) ─────────────────────────────────────────────────
+with st.expander("Manual Upload", expanded=False):
+    with st.expander("ROB Update"):
+        st.header("ROB Master Workbook Update")
+        csv_file = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="rob_csv")
+        xl_file  = st.file_uploader("Upload ROB Master Workbook (.xlsx)", type=["xlsx"], key="rob_xl")
+    
+        if csv_file and xl_file:
+            csv_bytes = csv_file.read()
+            xl_bytes  = xl_file.read()
+    
+            df = parse_csv(csv_bytes)
+            wb = openpyxl.load_workbook(io.BytesIO(xl_bytes), data_only=False)
+    
+            auto_sheet = first_uncolored_sheet(wb, ROB_SHEETS)
+            sheet_choice = st.selectbox("Week tab", ROB_SHEETS,
+                                        index=ROB_SHEETS.index(auto_sheet), key="rob_sheet")
+            st.caption(f"Auto-detected next tab: **{auto_sheet}**")
+    
+            if st.button("Preview Changes", key="rob_preview"):
+                ws = wb[sheet_choice]
+                changes = build_rob_change_plan(df, ws)
+                st.session_state["rob_changes"]   = changes
+                st.session_state["rob_wb_bytes"]  = xl_bytes
+                st.session_state["rob_sheet_sel"] = sheet_choice
+    
+            if "rob_changes" in st.session_state:
+                changes    = st.session_state["rob_changes"]
+                will_write = [c for c in changes if not c["skip_reason"]]
+                skipped    = [c for c in changes if c["skip_reason"]]
+    
+                c1, c2 = st.columns(2)
+                c1.metric("Cells to update", len(will_write))
+                c2.metric("Skipped",         len(skipped))
+    
+                preview_rows = []
+                for c in changes:
+                    preview_rows.append({
+                        "Month":  c["month"] or "—",
                         "Label":  c["label"],
                         "Row":    c["row"],
                         "Col":    c["col"],
                         "Value":  c["new_value"],
                         "Status": "✅ will write" if not c["skip_reason"] else f"⚠️ skip ({c['skip_reason']})",
                     })
-                st.dataframe(preview_next, use_container_width=True)
-
-            if st.button("Confirm and Apply Changes", key="fcst_apply"):
-                # Apply current month
-                wb_out = openpyxl.load_workbook(io.BytesIO(st.session_state["fcst_wb_bytes"]), data_only=False)
-                apply_forecast_changes(wb_out, st.session_state["fcst_sheet_sel"], fcst_ch)
-                color_tab_done(wb_out, st.session_state["fcst_sheet_sel"])
-                strip_tables(wb_out)
-                out3 = io.BytesIO()
-                wb_out.save(out3)
-                st.download_button(
-                    "Download Updated Current Month Forecast",
-                    data=out3.getvalue(),
-                    file_name="Forecast_current_updated.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-
-                # Apply next month (if uploaded)
-                if "fcst_next_changes" in st.session_state:
-                    wb_next_out = openpyxl.load_workbook(io.BytesIO(st.session_state["fcst_next_wb_bytes"]), data_only=False)
-                    apply_forecast_changes(wb_next_out, st.session_state["fcst_next_sheet_sel"],
-                                           st.session_state["fcst_next_changes"])
-                    color_tab_done(wb_next_out, st.session_state["fcst_next_sheet_sel"])
-                    strip_tables(wb_next_out)
-                    out4 = io.BytesIO()
-                    wb_next_out.save(out4)
+                st.dataframe(preview_rows, use_container_width=True)
+    
+                if st.button("Confirm and Apply Changes", key="rob_apply"):
+                    wb2 = openpyxl.load_workbook(io.BytesIO(st.session_state["rob_wb_bytes"]), data_only=False)
+                    apply_rob_changes(wb2, st.session_state["rob_sheet_sel"], changes)
+                    color_tab_done(wb2, st.session_state["rob_sheet_sel"])
+                    strip_tables(wb2)
+                    out = io.BytesIO()
+                    wb2.save(out)
                     st.download_button(
-                        "Download Updated Next Month Forecast",
-                        data=out4.getvalue(),
-                        file_name="Forecast_next_month_updated.xlsx",
+                        "Download Updated ROB Workbook",
+                        data=out.getvalue(),
+                        file_name="ROB_Master_updated.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
+    
+    with st.expander("Strategy Report"):
+        st.header("Strategy Report Update")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            csv_file2 = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="str_csv")
+        with col_b:
+            rate_file2 = st.file_uploader("Upload Rates & Restrictions CSV", type=["csv"], key="str_rate")
+    
+        col_c, col_d = st.columns(2)
+        with col_c:
+            xl_file2 = st.file_uploader("Upload Strategy Report Workbook (.xlsx)", type=["xlsx"], key="str_xl")
+    
+        if xl_file2:
+            xl_bytes2 = xl_file2.read()
+            wb2_peek  = openpyxl.load_workbook(io.BytesIO(xl_bytes2), data_only=False)
+    
+            auto_sheet2   = first_uncolored_sheet(wb2_peek, STRATEGY_SHEETS)
+            sheet_choice2 = st.selectbox("Week tab", STRATEGY_SHEETS,
+                                         index=STRATEGY_SHEETS.index(auto_sheet2), key="str_sheet")
+            st.caption(f"Auto-detected next tab: **{auto_sheet2}**")
+    
+            if (csv_file2 or rate_file2) and st.button("Preview Changes", key="str_preview"):
+                wb2_full = openpyxl.load_workbook(io.BytesIO(xl_bytes2), data_only=False)
+                all_changes = []
+    
+                if csv_file2:
+                    df2 = parse_csv(csv_file2.read())
+                    all_changes += build_strategy_change_plan(df2, wb2_full, sheet_choice2)
+    
+                rate_warnings = []
+                if rate_file2:
+                    rate_df = parse_rate_csv(rate_file2.read())
+                    rate_changes, rate_warnings = build_rates_change_plan(
+                        rate_df, wb2_full, sheet_choice2)
+                    all_changes += rate_changes
+    
+                st.session_state["str_changes"]   = all_changes
+                st.session_state["str_wb_bytes"]  = xl_bytes2
+                st.session_state["str_sheet_sel"] = sheet_choice2
+                st.session_state["str_warnings"]  = rate_warnings
+    
+            if "str_changes" in st.session_state:
+                for w in st.session_state.get("str_warnings", []):
+                    st.warning(w)
+    
+                changes2    = st.session_state["str_changes"]
+                will_write2 = [c for c in changes2 if not c["skip_reason"]]
+                skipped2    = [c for c in changes2 if c["skip_reason"]]
+    
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Cells to update", len(will_write2))
+                c2.metric("Skipped",         len(skipped2))
+                c3.metric("Days in scope",   len({c["date"] for c in changes2}))
+    
+                preview_rows2 = []
+                for c in changes2:
+                    preview_rows2.append({
+                        "Date":   str(c["date"]),
+                        "Label":  c["label"],
+                        "Row":    c["row"],
+                        "Col":    c["col"],
+                        "Value":  c["new_value"],
+                        "Status": "✅ will write" if not c["skip_reason"] else f"⚠️ skip ({c['skip_reason']})",
+                    })
+                st.dataframe(preview_rows2, use_container_width=True)
+    
+                if st.button("Confirm and Apply Changes", key="str_apply"):
+                    wb3 = openpyxl.load_workbook(io.BytesIO(st.session_state["str_wb_bytes"]), data_only=False)
+                    apply_strategy_changes(wb3, st.session_state["str_sheet_sel"], changes2)
+                    color_tab_done(wb3, st.session_state["str_sheet_sel"])
+                    strip_tables(wb3)
+                    out2 = io.BytesIO()
+                    wb3.save(out2)
+                    st.download_button(
+                        "Download Updated Strategy Workbook",
+                        data=out2.getvalue(),
+                        file_name="Strategy_Report_updated.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+    
+    with st.expander("Forecast"):
+        st.header("Forecast Update")
+    
+        fcst_csv     = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="fcst_csv")
+        fcst_xl      = st.file_uploader("Upload Current Month Forecast Workbook (.xlsx)", type=["xlsx"], key="fcst_xl")
+        st.caption("Weeks 3 & 4 only: also upload next month's forecast workbook.")
+        fcst_xl_next = st.file_uploader("Upload Next Month Forecast Workbook (.xlsx)", type=["xlsx"], key="fcst_xl_next")
+    
+        if fcst_xl:
+            fcst_bytes = fcst_xl.read()
+            wb_fcst_peek = openpyxl.load_workbook(io.BytesIO(fcst_bytes), data_only=False)
+    
+            avail_fcst = [s for s in FORECAST_SHEETS if s in wb_fcst_peek.sheetnames]
+            auto_fcst  = first_uncolored_sheet(wb_fcst_peek, avail_fcst) if avail_fcst else None
+            fcst_sheet = st.selectbox("Week tab", avail_fcst,
+                                      index=avail_fcst.index(auto_fcst) if auto_fcst else 0,
+                                      key="fcst_sheet")
+            if auto_fcst:
+                st.caption(f"Auto-detected next tab: **{auto_fcst}**")
+    
+            if fcst_xl_next:
+                fcst_next_bytes = fcst_xl_next.read()
+                wb_next_peek    = openpyxl.load_workbook(io.BytesIO(fcst_next_bytes), data_only=False)
+                avail_next      = [s for s in FORECAST_SHEETS if s in wb_next_peek.sheetnames]
+                auto_next       = first_uncolored_sheet(wb_next_peek, avail_next) if avail_next else None
+                fcst_sheet_next = st.selectbox("Next month week tab", avail_next,
+                                               index=avail_next.index(auto_next) if auto_next else 0,
+                                               key="fcst_sheet_next")
+                if auto_next:
+                    st.caption(f"Auto-detected next month tab: **{auto_next}**")
+    
+            if fcst_csv and st.button("Preview Changes", key="fcst_preview"):
+                csv_bytes = fcst_csv.read()
+    
+                # Current month workbook
+                wb_fcst_full = openpyxl.load_workbook(io.BytesIO(fcst_bytes), data_only=False)
+                df_fcst = parse_csv(csv_bytes)
+                ws_fcst = wb_fcst_full[fcst_sheet]
+                fcst_changes, fcst_warnings = build_forecast_change_plan(df_fcst, ws_fcst)
+    
+                st.session_state["fcst_changes"]   = fcst_changes
+                st.session_state["fcst_wb_bytes"]  = fcst_bytes
+                st.session_state["fcst_sheet_sel"] = fcst_sheet
+                st.session_state["fcst_warnings"]  = fcst_warnings
+    
+                # Next month workbook (weeks 3 & 4)
+                if fcst_xl_next:
+                    wb_next_full = openpyxl.load_workbook(io.BytesIO(fcst_next_bytes), data_only=False)
+                    ws_next      = wb_next_full[fcst_sheet_next]
+                    next_changes, next_warnings = build_next_month_forecast_plan(df_fcst, ws_next)
+                    st.session_state["fcst_next_changes"]   = next_changes
+                    st.session_state["fcst_next_wb_bytes"]  = fcst_next_bytes
+                    st.session_state["fcst_next_sheet_sel"] = fcst_sheet_next
+                    st.session_state["fcst_next_warnings"]  = next_warnings
+                else:
+                    st.session_state.pop("fcst_next_changes", None)
+    
+            if "fcst_changes" in st.session_state:
+                for w in st.session_state.get("fcst_warnings", []):
+                    st.warning(w)
+    
+                fcst_ch   = st.session_state["fcst_changes"]
+                will_fcst = [c for c in fcst_ch if not c["skip_reason"]]
+                skip_fcst = [c for c in fcst_ch if c["skip_reason"]]
+    
+                st.subheader("Current month changes")
+                c1, c2 = st.columns(2)
+                c1.metric("Cells to update", len(will_fcst))
+                c2.metric("Skipped",         len(skip_fcst))
+    
+                preview_fcst = []
+                for c in fcst_ch:
+                    preview_fcst.append({
+                        "Label":  c["label"],
+                        "Row":    c["row"],
+                        "Col":    c["col"],
+                        "Value":  c["new_value"],
+                        "Status": "✅ will write" if not c["skip_reason"] else f"⚠️ skip ({c['skip_reason']})",
+                    })
+                st.dataframe(preview_fcst, use_container_width=True)
+    
+                if "fcst_next_changes" in st.session_state:
+                    next_ch = st.session_state["fcst_next_changes"]
+                    for w in st.session_state.get("fcst_next_warnings", []):
+                        st.warning(w)
+                    will_next = [c for c in next_ch if not c["skip_reason"]]
+                    skip_next = [c for c in next_ch if c["skip_reason"]]
+                    st.subheader("Next month changes")
+                    n1, n2 = st.columns(2)
+                    n1.metric("Cells to update", len(will_next))
+                    n2.metric("Skipped",         len(skip_next))
+                    preview_next = []
+                    for c in next_ch:
+                        preview_next.append({
+                            "Label":  c["label"],
+                            "Row":    c["row"],
+                            "Col":    c["col"],
+                            "Value":  c["new_value"],
+                            "Status": "✅ will write" if not c["skip_reason"] else f"⚠️ skip ({c['skip_reason']})",
+                        })
+                    st.dataframe(preview_next, use_container_width=True)
+    
+                if st.button("Confirm and Apply Changes", key="fcst_apply"):
+                    # Apply current month
+                    wb_out = openpyxl.load_workbook(io.BytesIO(st.session_state["fcst_wb_bytes"]), data_only=False)
+                    apply_forecast_changes(wb_out, st.session_state["fcst_sheet_sel"], fcst_ch)
+                    color_tab_done(wb_out, st.session_state["fcst_sheet_sel"])
+                    strip_tables(wb_out)
+                    out3 = io.BytesIO()
+                    wb_out.save(out3)
+                    st.download_button(
+                        "Download Updated Current Month Forecast",
+                        data=out3.getvalue(),
+                        file_name="Forecast_current_updated.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+    
+                    # Apply next month (if uploaded)
+                    if "fcst_next_changes" in st.session_state:
+                        wb_next_out = openpyxl.load_workbook(io.BytesIO(st.session_state["fcst_next_wb_bytes"]), data_only=False)
+                        apply_forecast_changes(wb_next_out, st.session_state["fcst_next_sheet_sel"],
+                                               st.session_state["fcst_next_changes"])
+                        color_tab_done(wb_next_out, st.session_state["fcst_next_sheet_sel"])
+                        strip_tables(wb_next_out)
+                        out4 = io.BytesIO()
+                        wb_next_out.save(out4)
+                        st.download_button(
+                            "Download Updated Next Month Forecast",
+                            data=out4.getvalue(),
+                            file_name="Forecast_next_month_updated.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        )
+    
+st.divider()
+# ── Google Drive Update ───────────────────────────────────────────────────────
+st.header("Google Drive Update")
+st.caption(f"Current month: **{datetime.date.today().strftime('%B %Y')}**")
+
+col_h, col_w = st.columns(2)
+with col_h:
+    hotel_sel = st.selectbox("Hotel", HOTELS, key="drive_hotel")
+with col_w:
+    wb_sels = st.multiselect(
+        "Workbooks to update",
+        WORKBOOK_TYPES,
+        default=WORKBOOK_TYPES,
+        key="drive_wb",
+    )
+
+drive_csv = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="drive_csv")
+drive_rate_csv = None
+if "Strategy Report" in (wb_sels or []):
+    drive_rate_csv = st.file_uploader("Upload Rates & Restrictions CSV", type=["csv"], key="drive_rate_csv")
+
+def build_all_plans(svc, hotel_sel, wb_sels, df, rate_df):
+    all_plans = {}
+    for wb_type in wb_sels:
+        result, err = resolve_drive_workbook(svc, hotel_sel, wb_type)
+        if err:
+            st.error(f"{wb_type}: {err}")
+            continue
+        file_id, file_name = result
+        wb_bytes = drive_download(svc, file_id)
+        wb       = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
+        if wb_type == "ROB":
+            avail    = [s for s in ROB_SHEETS if s in wb.sheetnames]
+            auto     = first_uncolored_sheet(wb, avail)
+            sheet    = auto or avail[0]
+            changes  = build_rob_change_plan(df, wb[sheet])
+            warnings = []
+        elif wb_type == "Strategy Report":
+            avail    = [s for s in STRATEGY_SHEETS if s in wb.sheetnames]
+            auto     = first_uncolored_sheet(wb, avail)
+            sheet    = auto or avail[0]
+            changes  = build_strategy_change_plan(df, wb, sheet)
+            warnings = []
+            if rate_df is not None:
+                rate_changes, rate_warnings = build_rates_change_plan(rate_df, wb, sheet)
+                changes  += rate_changes
+                warnings += rate_warnings
+        else:  # Forecast
+            avail    = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
+            auto     = first_uncolored_sheet(wb, avail)
+            sheet    = auto or avail[0]
+            changes, warnings = build_forecast_change_plan(df, wb[sheet])
+        all_plans[wb_type] = {
+            "file_id":   file_id,
+            "file_name": file_name,
+            "wb_bytes":  wb_bytes,
+            "sheet":     sheet,
+            "changes":   changes,
+            "warnings":  warnings,
+        }
+    return all_plans
+
+
+def apply_and_upload(svc, all_plans):
+    saved, errors = [], []
+    for wb_type, plan in all_plans.items():
+        try:
+            wb_apply = openpyxl.load_workbook(io.BytesIO(plan["wb_bytes"]), data_only=False)
+            if wb_type == "ROB":
+                apply_rob_changes(wb_apply, plan["sheet"], plan["changes"])
+            elif wb_type == "Strategy Report":
+                apply_strategy_changes(wb_apply, plan["sheet"], plan["changes"])
+            else:
+                apply_forecast_changes(wb_apply, plan["sheet"], plan["changes"])
+            color_tab_done(wb_apply, plan["sheet"])
+            strip_tables(wb_apply)
+            out = io.BytesIO()
+            wb_apply.save(out)
+            drive_upload(svc, plan["file_id"], out.getvalue(), plan["file_name"])
+            saved.append(plan["file_name"])
+        except Exception as e:
+            errors.append(f"{wb_type}: {e}")
+    return saved, errors
+
+
+ready = drive_csv and wb_sels
+
+if test_mode:
+    # ── Test mode: preview first, then confirm ────────────────────────────────
+    if ready and st.button("Preview Changes", key="drive_preview"):
+        try:
+            svc     = get_drive_service()
+            df      = parse_csv(drive_csv.read())
+            rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
+            st.session_state["drive_plans"]     = build_all_plans(svc, hotel_sel, wb_sels, df, rate_df)
+            st.session_state["drive_hotel_sel"] = hotel_sel
+        except Exception as e:
+            st.error(f"Drive error: {e}")
+
+    if "drive_plans" in st.session_state:
+        all_plans = st.session_state["drive_plans"]
+        for wb_type, plan in all_plans.items():
+            st.subheader(wb_type)
+            st.caption(f"File: **{plan['file_name']}** — Tab: **{plan['sheet']}**")
+            for w in plan["warnings"]:
+                st.warning(w)
+            ch = plan["changes"]
+            will_write = [c for c in ch if not c["skip_reason"]]
+            skipped    = [c for c in ch if c["skip_reason"]]
+            c1, c2 = st.columns(2)
+            c1.metric("Cells to update", len(will_write))
+            c2.metric("Skipped",         len(skipped))
+            st.dataframe([{
+                "Label":  c["label"],
+                "Row":    c["row"],
+                "Col":    c["col"],
+                "Value":  c["new_value"],
+                "Status": "✅ will write" if not c["skip_reason"] else f"⚠️ skip ({c['skip_reason']})",
+            } for c in ch], use_container_width=True)
+
+        if st.button("Confirm and Save All to Google Drive", key="drive_apply"):
+            try:
+                saved, errors = apply_and_upload(get_drive_service(), all_plans)
+                for name in saved:
+                    st.success(f"Saved **{name}** to Google Drive.")
+                for err in errors:
+                    st.error(err)
+            except Exception as e:
+                st.error(f"Drive error: {e}")
+else:
+    # ── Normal mode: one click ────────────────────────────────────────────────
+    if ready and st.button("Upload Data to Workbooks", key="drive_go", type="primary"):
+        try:
+            svc     = get_drive_service()
+            df      = parse_csv(drive_csv.read())
+            rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
+            with st.spinner("Updating workbooks in Google Drive..."):
+                all_plans       = build_all_plans(svc, hotel_sel, wb_sels, df, rate_df)
+                saved, errors   = apply_and_upload(svc, all_plans)
+            for name in saved:
+                st.success(f"Saved **{name}** to Google Drive.")
+            for err in errors:
+                st.error(err)
+        except Exception as e:
+            st.error(f"Drive error: {e}")
+
