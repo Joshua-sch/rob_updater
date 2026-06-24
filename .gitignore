@@ -1,0 +1,9 @@
+# Google service account credentials - never commit this
+credentials.json.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Streamlit cache
+.streamlit/secrets.toml
