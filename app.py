@@ -190,6 +190,7 @@ STRATEGY_FIELD_PATTERNS = {
     "ooo_rms":      [("OOO", None)],
     "trans_rev_ty": [("TY TRANS", "REV"),        ("TRAN", "REV TY")],
     "grp_rev_ty":   [("GRP TY", "REV"),          ("GRP", "REV TY")],
+    "otb_lst_wk":   [("OTB LST", None),          ("LST WK", None),       ("LAST WK", None), ("LST WEK", None)],
 }
 
 
@@ -301,7 +302,7 @@ def find_otb_date_cell(ws):
     return 2, 4  # fallback
 
 
-def build_strategy_change_plan(df, wb, sheet_name):
+def build_strategy_change_plan(df, wb, sheet_name, drive_service=None, hotel_id=None, hotel_name=None):
     today = datetime.date.today()
     scope_start = today.replace(day=1)
     scope_end = datetime.date(today.year, 12, 31)
@@ -311,9 +312,15 @@ def build_strategy_change_plan(df, wb, sheet_name):
 
     # Detect actual column positions from headers — no guessing
     col_map = detect_strategy_columns(ws)
-    missing = [f for f, c in col_map.items() if c is None]
+    missing = [f for f, c in col_map.items() if c is None
+               and f != "otb_lst_wk"]  # otb_lst_wk only expected on WKONE
     if missing:
         st.warning(f"Strategy: could not locate columns for: {', '.join(missing)}")
+
+    # For WKONE, pull OTB Lst Wek from previous month's SR
+    prev_otb_map = {}
+    if sheet_name == "WKONE" and col_map.get("otb_lst_wk") and drive_service and hotel_id:
+        prev_otb_map = get_prev_month_otb_trans(drive_service, hotel_id, hotel_name or "", scope_start)
 
     changes = []
 
@@ -347,6 +354,15 @@ def build_strategy_change_plan(df, wb, sheet_name):
             changes.append({
                 "date": d, "row": excel_row, "col": excel_col,
                 "label": label, "new_value": val, "skip_reason": skip,
+            })
+
+        # OTB Lst Wek — WKONE only, sourced from previous month's SR
+        lst_wk_col = col_map.get("otb_lst_wk")
+        if lst_wk_col and d in prev_otb_map:
+            skip = "formula" if is_formula(ws.cell(excel_row, lst_wk_col).value) else None
+            changes.append({
+                "date": d, "row": excel_row, "col": lst_wk_col,
+                "label": "OTB Lst Wek", "new_value": prev_otb_map[d], "skip_reason": skip,
             })
 
     return changes
@@ -800,6 +816,172 @@ def drive_upload(service, file_id, file_bytes: bytes, file_name: str):
     service.files().update(fileId=file_id, media_body=media).execute()
 
 
+def drive_find_or_create_month_folder(service, rev_id: str, year_id: str, month_date: datetime.date, hotel_name: str):
+    """Return (folder_id, folder_name) for the month folder under year_id.
+    Folder name pattern: '[LETTER]: [MON][YEAR] REVENUE REPORTS [HOTEL_UPPER]'
+    where LETTER = A-L for Jan-Dec.
+    Creates the folder if it doesn't exist.
+    """
+    month_kw = month_date.strftime("%b%Y").upper()  # e.g. JUL2026
+
+    # Try to find existing folder first
+    q = ("mimeType='application/vnd.google-apps.folder' and trashed=false "
+         "and '%s' in parents") % year_id
+    result = service.files().list(q=q, fields="files(id,name)", pageSize=100).execute()
+    for f in result.get("files", []):
+        if month_kw in f["name"].upper():
+            return f["id"], f["name"]
+
+    # Not found — infer name from existing sibling folder naming pattern
+    # Pattern: "[LETTER]: [MON][YEAR] REVENUE REPORTS [HOTEL]"
+    letter = chr(ord("A") + month_date.month - 1)  # A=Jan, B=Feb, ..., L=Dec
+
+    # Try to infer hotel suffix from existing month folders in this year folder
+    hotel_suffix = hotel_name.upper()
+    for f in result.get("files", []):
+        name_upper = f["name"].upper()
+        if "REVENUE REPORTS" in name_upper:
+            # Extract everything after "REVENUE REPORTS "
+            idx = name_upper.find("REVENUE REPORTS ")
+            if idx != -1:
+                hotel_suffix = f["name"][idx + len("REVENUE REPORTS "):].strip()
+                break
+
+    new_name = f"{letter}: {month_kw} REVENUE REPORTS {hotel_suffix}"
+    folder_meta = {
+        "name": new_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [year_id],
+    }
+    created = service.files().create(body=folder_meta, fields="id,name").execute()
+    return created["id"], created["name"]
+
+
+def drive_copy_file(service, source_file_id: str, new_name: str, parent_folder_id: str):
+    """Copy a Drive file to a new name in the given folder. Returns (new_file_id, new_name)."""
+    body = {"name": new_name, "parents": [parent_folder_id]}
+    copied = service.files().copy(fileId=source_file_id, body=body, fields="id,name").execute()
+    return copied["id"], copied["name"]
+
+
+def find_sr_master(service, hotel_id: str):
+    """Search the hotel's REVENUE REPORTS tree for the SR master file.
+    Returns (file_id, file_name) or (None, error_str).
+    """
+    rev_id, rev_name = drive_find_folder_by_keyword(service, "REVENUE REPORTS", parent_id=hotel_id)
+    if not rev_id:
+        return None, "No REVENUE REPORTS folder found."
+
+    # Search all subfolders for a file with MASTER and STRATEGY in the name
+    q = ("trashed=false "
+         "and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+         "and name contains 'MASTER' and name contains 'STRATEGY'")
+    result = service.files().list(q=q, fields="files(id,name,parents)", pageSize=50).execute()
+    for f in result.get("files", []):
+        return f["id"], f["name"]
+    return None, "No STRATEGY master file found in Drive."
+
+
+def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date):
+    """
+    New month SR setup:
+      1. Find SR master, copy it, rename to [MON][YEAR] STRATEGY [HOTEL].xlsx
+      2. Find or create month folder under the year folder
+      3. Move the copy into that folder
+    Returns (new_file_name, error_str).
+    """
+    year_kw = str(target_month.year)
+    month_kw = target_month.strftime("%b%Y").upper()
+
+    # Resolve REVENUE REPORTS and year folder
+    rev_id, _ = drive_find_folder_by_keyword(service, "REVENUE REPORTS", parent_id=hotel_id)
+    if not rev_id:
+        return None, "No REVENUE REPORTS folder."
+    year_id, _ = drive_find_folder_by_keyword(service, year_kw, parent_id=rev_id)
+    if not year_id:
+        return None, f"No {year_kw} folder."
+
+    # Find or create month folder
+    month_id, month_name = drive_find_or_create_month_folder(service, rev_id, year_id, target_month, hotel_name)
+
+    # Check if SR already exists in that folder
+    existing_id, existing_name = drive_find_file(service, "STRATEGY", month_id)
+    if existing_id and "master" not in existing_name.lower():
+        return existing_name, None  # already set up
+
+    # Find master
+    master_id, master_name = find_sr_master(service, hotel_id)
+    if not master_id:
+        return None, master_name  # error string
+
+    # Infer hotel suffix from master file name for the new file name
+    # e.g. "MASTER 2026 STRATEGY PLYMOUTH.xlsx" → "PLYMOUTH"
+    hotel_suffix = hotel_name.upper()
+    name_upper = master_name.upper().replace(".XLSX", "")
+    if "STRATEGY" in name_upper:
+        after = name_upper[name_upper.find("STRATEGY") + len("STRATEGY"):].strip()
+        if after:
+            hotel_suffix = master_name[master_name.upper().find("STRATEGY") + len("STRATEGY"):].strip().replace(".xlsx", "").replace(".XLSX", "").strip()
+
+    new_file_name = f"{month_kw} STRATEGY {hotel_suffix}.xlsx"
+    _, created_name = drive_copy_file(service, master_id, new_file_name, month_id)
+    return created_name, None
+
+
+def get_prev_month_otb_trans(service, hotel_id: str, hotel_name: str, current_month: datetime.date):
+    """Pull OTB TY Trans values for current_month dates from previous month's SR last filled tab.
+    Returns {date: value} or {} on any failure.
+    """
+    prev_month = (current_month.replace(day=1) - datetime.timedelta(days=1)).replace(day=1)
+    result, err = resolve_drive_workbook(service, hotel_id, hotel_name, "Strategy Report", month_date=prev_month)
+    if err or not result:
+        return {}
+
+    file_id, _ = result
+    try:
+        file_bytes = drive_download(service, file_id)
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=False)
+    except Exception:
+        return {}
+
+    # Find last filled (colored) tab
+    last_filled_sheet = None
+    for sheet_name in STRATEGY_SHEETS:
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        tab_color = ws.sheet_properties.tabColor
+        if tab_color is not None:
+            last_filled_sheet = sheet_name
+
+    if not last_filled_sheet:
+        return {}
+
+    ws = wb[last_filled_sheet]
+    col_map = detect_strategy_columns(ws)
+    otb_col = col_map.get("otb_trans")
+    date_col = detect_date_column(ws)
+    if not otb_col:
+        return {}
+
+    result_map = {}
+    for r in range(5, ws.max_row + 1):
+        date_val = ws.cell(r, date_col).value
+        if isinstance(date_val, datetime.datetime):
+            d = date_val.date()
+        elif isinstance(date_val, datetime.date):
+            d = date_val
+        else:
+            continue
+        if d < current_month:
+            continue
+        cell_val = ws.cell(r, otb_col).value
+        if cell_val is not None and not is_formula(cell_val):
+            result_map[d] = safe_float(cell_val)
+
+    return result_map
+
+
 def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_type: str, month_date: datetime.date = None):
     """
     Walk Drive: Hotel > REVENUE REPORTS > Year > Month > file.
@@ -1188,6 +1370,27 @@ forecast_next_month = False
 if "Forecast" in (wb_sels or []):
     forecast_next_month = st.checkbox("Forecast next month as well?", key="drive_fcst_next")
 
+start_new_month = st.checkbox("Start new month", key="drive_new_month")
+if start_new_month:
+    with st.container(border=True):
+        st.markdown("**New Month Setup**")
+        next_month_dt = (datetime.date.today().replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+        st.caption(f"Target month: **{next_month_dt.strftime('%B %Y')}**")
+        new_month_hotel = hotel_sel
+        if st.button("Set Up Strategy Report for New Month", key="btn_new_month_sr"):
+            try:
+                svc = get_drive_service()
+                hotel_id_nm = hotel_id_map.get(new_month_hotel, "")
+                with st.spinner(f"Setting up {next_month_dt.strftime('%b %Y')} SR for {new_month_hotel}..."):
+                    created_name, err = setup_new_sr_month(svc, hotel_id_nm, new_month_hotel, next_month_dt)
+                if err:
+                    st.error(f"New month setup failed: {err}")
+                else:
+                    st.success(f"Created **{created_name}** in Drive — ready for {next_month_dt.strftime('%B %Y')}.")
+            except Exception as e:
+                st.error(f"New month setup error: {e}")
+
+
 def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_next_month=False):
     all_plans = {}
     for wb_type in wb_sels:
@@ -1208,7 +1411,7 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
             avail    = [s for s in STRATEGY_SHEETS if s in wb.sheetnames]
             auto     = first_uncolored_sheet(wb, avail)
             sheet    = auto or avail[0]
-            changes  = build_strategy_change_plan(df, wb, sheet)
+            changes  = build_strategy_change_plan(df, wb, sheet, drive_service=svc, hotel_id=hotel_id, hotel_name=hotel_sel)
             warnings = []
             if rate_df is not None:
                 rate_changes, rate_warnings = build_rates_change_plan(rate_df, wb, sheet)
