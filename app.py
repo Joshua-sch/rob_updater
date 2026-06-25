@@ -169,22 +169,116 @@ STRATEGY_SHEETS = ["WKONE", "WKTWO", "WKTHREE", "WKFOUR", "WKFIVE"]
 FORECAST_SHEETS = ["FCST-WK1", "FCST-WK2", "FCST-WK3", "FCST-WK4",
                    "FCST-WK5", "FCST-WK6", "FCST-WK7", "FCST-WK8", "FCST-WK9"]
 
-# openpyxl col index → (header label, CSV col index)
-STRATEGY_COLS = {
-    4:  ("OTB TY Trans (Indiv Count)", 15),
-    9:  ("GRP PU TY",                   7),
-    14: ("GRP N/PU TY",                 8),
-    21: ("OOO RMS",                     4),
-    35: ("Trans Rev TY",               16),
-    43: ("Grp Rev TY",                  9),
+# CSV column index for each field (0-based) — source data never changes
+STRATEGY_CSV_COLS = {
+    "otb_trans":    (15, "OTB TY Trans (Indiv Count)"),
+    "grp_pu_ty":    ( 7, "GRP PU TY"),
+    "grp_npu_ty":   ( 8, "GRP N/PU TY"),
+    "ooo_rms":      ( 4, "OOO RMS"),
+    "trans_rev_ty": (16, "Trans Rev TY"),
+    "grp_rev_ty":   ( 9, "Grp Rev TY"),
+}
+
+# Each field: list of (row3_keyword, row4_keyword) pairs to try in order.
+# Match = both keywords found (case-insensitive) in their respective rows of that column.
+# A None keyword means "don't check that row."
+# "!LY" suffix on a keyword means the column must NOT contain "LY" in either header row.
+STRATEGY_FIELD_PATTERNS = {
+    "otb_trans":    [("OTB TY", "TRANS"),       ("TRANS!LY", "SOLD!LY")],
+    "grp_pu_ty":    [("GRP PU", "TY!LY"),       ("GROUP!LY", "SOLD!LY")],
+    "grp_npu_ty":   [("GRP N/PU", "TY!LY"),     ("GRP RMS", "N/PU"),    ("N/PU", None)],
+    "ooo_rms":      [("OOO", None)],
+    "trans_rev_ty": [("TY TRANS", "REV"),        ("TRAN", "REV TY")],
+    "grp_rev_ty":   [("GRP TY", "REV"),          ("GRP", "REV TY")],
 }
 
 
+def _kw_matches(cell_val, keyword, r3_val, r4_val):
+    """Check if keyword matches cell_val. If keyword ends with !LY,
+    also verify neither r3_val nor r4_val contains 'LY'."""
+    must_not_ly = keyword.endswith("!LY")
+    kw = keyword.replace("!LY", "").strip()
+    if kw.upper() not in str(cell_val or "").upper():
+        return False
+    if must_not_ly:
+        if "LY" in str(r3_val or "").upper() or "LY" in str(r4_val or "").upper():
+            return False
+    return True
+
+
+def detect_strategy_columns(ws):
+    """Scan rows 3+4 of ws and return {field_key: col_index} for each field.
+    Raises ValueError listing any fields that could not be found.
+    """
+    max_col = ws.max_column
+    # Build lookup: col → (r3_text, r4_text)
+    headers = {}
+    for c in range(1, max_col + 1):
+        headers[c] = (
+            str(ws.cell(3, c).value or "").strip(),
+            str(ws.cell(4, c).value or "").strip(),
+        )
+
+    col_map = {}
+    for field, patterns in STRATEGY_FIELD_PATTERNS.items():
+        found = None
+        for r3_kw, r4_kw in patterns:
+            for c, (r3v, r4v) in headers.items():
+                r3_ok = r3_kw is None or _kw_matches(r3v, r3_kw, r3v, r4v)
+                r4_ok = r4_kw is None or _kw_matches(r4v, r4_kw, r3v, r4v)
+                if r3_ok and r4_ok and (r3_kw or r4_kw):
+                    found = c
+                    break
+            if found:
+                break
+        if found:
+            col_map[field] = found
+        else:
+            col_map[field] = None  # will surface as a warning, not a crash
+
+    return col_map
+
+
+def detect_date_column(ws):
+    """Find the column whose data rows (5+) contain the earliest daily dates —
+    i.e. the column that maps to each row's actual calendar date.
+    Scans cols 1-10 only (dates are always on the left side).
+    """
+    import collections
+    col_dates = collections.defaultdict(list)
+    for r in range(5, min(ws.max_row + 1, 15)):
+        for c in range(1, 11):
+            v = ws.cell(r, c).value
+            if isinstance(v, datetime.datetime):
+                col_dates[c].append(v.date())
+            elif isinstance(v, datetime.date):
+                col_dates[c].append(v)
+
+    # Pick the col with the most dates that form a consecutive daily sequence
+    best_col, best_score = 3, 0  # fallback to col 3
+    for c, dates in col_dates.items():
+        if len(dates) < 3:
+            continue
+        dates_sorted = sorted(dates)
+        consecutive = sum(
+            1 for i in range(1, len(dates_sorted))
+            if (dates_sorted[i] - dates_sorted[i-1]).days == 1
+        )
+        # Prefer the col with earliest starting date (first of month)
+        score = consecutive * 10 - dates_sorted[0].day
+        if score > best_score:
+            best_score = score
+            best_col = c
+    return best_col
+
+
 def build_date_row_map(wb):
+    """Build {date: row_number} from WKONE using auto-detected date column."""
     ws = wb["WKONE"]
+    date_col = detect_date_column(ws)
     mapping = {}
     for row_num in range(5, ws.max_row + 1):
-        val = ws.cell(row_num, 3).value
+        val = ws.cell(row_num, date_col).value
         if isinstance(val, datetime.datetime):
             mapping[val.date()] = row_num
         elif isinstance(val, datetime.date):
@@ -193,16 +287,17 @@ def build_date_row_map(wb):
 
 
 def find_otb_date_cell(ws):
-    """Find the cell that holds the as-of date above the OTB TY TRANS header.
-    Scans for a column where consecutive rows contain 'OTB TY' then 'TRANS'
-    and returns (row-above, col). Falls back to (2, 4) if not found.
+    """Return (row, col) of the as-of date cell — one row above the OTB/TRANS header.
+    Tries both Plymouth-style (OTB TY / TRANS) and Long Beach-style (TRANS / SOLD).
     """
-    for r in range(1, 20):
-        for c in range(1, ws.max_column + 1):
-            v = str(ws.cell(r, c).value or "").strip().upper()
-            v_next = str(ws.cell(r + 1, c).value or "").strip().upper()
-            if v == "OTB TY" and v_next == "TRANS":
-                return r - 1, c
+    col_map = detect_strategy_columns(ws)
+    otb_col = col_map.get("otb_trans")
+    if otb_col:
+        # Find which of rows 3 or 4 has the header, then go one above
+        for r in range(2, 6):
+            v = str(ws.cell(r, otb_col).value or "").strip().upper()
+            if "OTB" in v or "TRANS" in v or "SOLD" in v:
+                return r - 1, otb_col
     return 2, 4  # fallback
 
 
@@ -213,6 +308,13 @@ def build_strategy_change_plan(df, wb, sheet_name):
 
     date_row_map = build_date_row_map(wb)
     ws = wb[sheet_name]
+
+    # Detect actual column positions from headers — no guessing
+    col_map = detect_strategy_columns(ws)
+    missing = [f for f, c in col_map.items() if c is None]
+    if missing:
+        st.warning(f"Strategy: could not locate columns for: {', '.join(missing)}")
+
     changes = []
 
     # Today's date above the OTB TY TRANS header
@@ -236,7 +338,10 @@ def build_strategy_change_plan(df, wb, sheet_name):
             continue
 
         excel_row = date_row_map[d]
-        for excel_col, (label, csv_col) in STRATEGY_COLS.items():
+        for field, (csv_col, label) in STRATEGY_CSV_COLS.items():
+            excel_col = col_map.get(field)
+            if excel_col is None:
+                continue  # column not found in this sheet — already warned above
             val = safe_float(row[csv_col])
             skip = "formula" if is_formula(ws.cell(excel_row, excel_col).value) else None
             changes.append({
