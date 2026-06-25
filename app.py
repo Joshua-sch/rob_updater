@@ -4,6 +4,7 @@ import openpyxl
 import io
 import re
 import datetime
+import bcrypt
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
@@ -596,12 +597,38 @@ def apply_forecast_changes(wb, sheet_name, changes):
 
 # ── Google Drive ──────────────────────────────────────────────────────────────
 
-HOTELS = ["Plymouth"]
+@st.cache_data(ttl=300)
+def get_hotels_from_drive():
+    """Return list of (display_name, folder_id) for every top-level folder
+    that contains a 'REVENUE REPORTS' subfolder — i.e. each hotel folder.
+    Cached for 5 minutes so it doesn't hit Drive on every rerender.
+    """
+    try:
+        svc = get_drive_service()
+        # All folders visible to the service account
+        q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        result = svc.files().list(q=q, fields="files(id, name)", pageSize=100).execute()
+        folders = result.get("files", [])
 
-# Maps hotel name → keyword to match against Drive folder names (case-insensitive)
-HOTEL_FOLDER_KEYWORDS = {
-    "Plymouth": "Plymouth - TEST",
-}
+        hotels = []
+        for folder in folders:
+            name = folder["name"]
+            # Skip revenue report folders, year folders, month folders
+            if "REVENUE REPORTS" in name.upper():
+                continue
+            if re.search(r'\b20\d{2}\b', name):
+                continue
+            # Must have a child folder containing "REVENUE REPORTS"
+            child_q = ("'%s' in parents and trashed = false and "
+                       "mimeType = 'application/vnd.google-apps.folder'") % folder["id"]
+            children = svc.files().list(q=child_q, fields="files(name)", pageSize=20).execute()
+            has_rev = any("REVENUE REPORTS" in c["name"].upper() for c in children.get("files", []))
+            if has_rev:
+                hotels.append((name, folder["id"]))
+
+        return sorted(hotels, key=lambda x: x[0])
+    except Exception:
+        return []
 
 WORKBOOK_TYPES = ["ROB", "Strategy Report", "Forecast"]
 
@@ -668,28 +695,40 @@ def drive_upload(service, file_id, file_bytes: bytes, file_name: str):
     service.files().update(fileId=file_id, media_body=media).execute()
 
 
-def resolve_drive_workbook(service, hotel: str, workbook_type: str):
+def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_type: str, month_date: datetime.date = None):
     """
-    Walk Drive: hotel folder (keyword match) → month folder (YYYYMMm keyword) → file.
+    Walk Drive: Hotel > REVENUE REPORTS > Year > Month > file.
     Returns ((file_id, file_name), None) or (None, error_message).
+    Never touches files whose name contains 'master'.
     """
-    today      = datetime.date.today()
-    # Month keyword: e.g. "JUN2026" matches "F: JUN2026 REVENUE REPORTS PLYMOUTH"
-    month_kw   = today.strftime("%b%Y").upper()          # e.g. "JUN2026"
-    hotel_kw   = HOTEL_FOLDER_KEYWORDS[hotel]
+    if month_date is None:
+        month_date = datetime.date.today()
+
+    month_kw   = month_date.strftime("%b%Y").upper()
+    year_kw    = str(month_date.year)
     wb_keyword = WORKBOOK_KEYWORDS[workbook_type]
 
-    hotel_id, hotel_name = drive_find_folder_by_keyword(service, hotel_kw)
-    if not hotel_id:
-        return None, f"No folder containing '{hotel_kw}' found in Drive."
+    # Revenue Reports folder
+    rev_id, rev_name = drive_find_folder_by_keyword(service, "REVENUE REPORTS", parent_id=hotel_id)
+    if not rev_id:
+        return None, f"No 'REVENUE REPORTS' folder found under '{hotel_name}'."
 
-    month_id, month_name = drive_find_folder_by_keyword(service, month_kw, parent_id=hotel_id)
+    # Year folder
+    year_id, year_name = drive_find_folder_by_keyword(service, year_kw, parent_id=rev_id)
+    if not year_id:
+        return None, f"No '{year_kw}' folder found under '{rev_name}'."
+
+    # Month folder
+    month_id, month_name = drive_find_folder_by_keyword(service, month_kw, parent_id=year_id)
     if not month_id:
-        return None, f"No folder containing '{month_kw}' found under '{hotel_name}'."
+        return None, f"No '{month_kw}' folder found under '{year_name}'."
 
+    # File — never match master docs
     file_id, file_name = drive_find_file(service, wb_keyword, month_id)
     if not file_id:
         return None, f"No '{wb_keyword}' workbook found in '{month_name}'."
+    if "master" in file_name.lower():
+        return None, f"Resolved file '{file_name}' looks like a master doc — aborting."
 
     return (file_id, file_name), None
 
@@ -697,6 +736,30 @@ def resolve_drive_workbook(service, hotel: str, workbook_type: str):
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Linchris Weekly Tools", layout="wide")
+
+# ── Login gate ────────────────────────────────────────────────────────────────
+def check_login(username: str, password: str) -> bool:
+    correct_user = st.secrets["auth"]["username"]
+    correct_hash = st.secrets["auth"]["password_hash"].encode()
+    return username == correct_user and bcrypt.checkpw(password.encode(), correct_hash)
+
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
+if not st.session_state["authenticated"]:
+    st.title("Linchris Hotel Corporation")
+    st.subheader("Please log in to continue")
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Log In")
+        if submitted:
+            if check_login(username, password):
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect username or password.")
+    st.stop()
 
 st.markdown("""
 <style>
@@ -997,9 +1060,13 @@ st.divider()
 st.header("Google Drive Update")
 st.caption(f"Current month: **{datetime.date.today().strftime('%B %Y')}**")
 
+hotels = get_hotels_from_drive()
+hotel_names = [h[0] for h in hotels]
+hotel_id_map = {h[0]: h[1] for h in hotels}
+
 col_h, col_w = st.columns(2)
 with col_h:
-    hotel_sel = st.selectbox("Hotel", HOTELS, key="drive_hotel")
+    hotel_sel = st.selectbox("Hotel", hotel_names if hotel_names else ["(no hotels found)"], key="drive_hotel")
 with col_w:
     wb_sels = st.multiselect(
         "Workbooks to update",
@@ -1016,10 +1083,10 @@ forecast_next_month = False
 if "Forecast" in (wb_sels or []):
     forecast_next_month = st.checkbox("Forecast next month as well?", key="drive_fcst_next")
 
-def build_all_plans(svc, hotel_sel, wb_sels, df, rate_df, forecast_next_month=False):
+def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_next_month=False):
     all_plans = {}
     for wb_type in wb_sels:
-        result, err = resolve_drive_workbook(svc, hotel_sel, wb_type)
+        result, err = resolve_drive_workbook(svc, hotel_id, hotel_sel, wb_type)
         if err:
             st.error(f"{wb_type}: {err}")
             continue
@@ -1058,31 +1125,26 @@ def build_all_plans(svc, hotel_sel, wb_sels, df, rate_df, forecast_next_month=Fa
 
     # Next-month Forecast: only when checkbox is ticked
     if "Forecast" in wb_sels and forecast_next_month:
-        today         = datetime.date.today()
-        next_month_dt = (today.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
-        next_month_kw = next_month_dt.strftime("%b%Y").upper()   # e.g. "JUL2026"
-        hotel_kw      = HOTEL_FOLDER_KEYWORDS[hotel_sel]
-
-        hotel_id, _ = drive_find_folder_by_keyword(svc, hotel_kw)
-        if hotel_id:
-            nm_folder_id, nm_folder_name = drive_find_folder_by_keyword(svc, next_month_kw, parent_id=hotel_id)
-            if nm_folder_id:
-                nm_file_id, nm_file_name = drive_find_file(svc, WORKBOOK_KEYWORDS["Forecast"], nm_folder_id)
-                if nm_file_id:
-                    nm_bytes = drive_download(svc, nm_file_id)
-                    nm_wb    = openpyxl.load_workbook(io.BytesIO(nm_bytes), data_only=False)
-                    nm_avail = [s for s in FORECAST_SHEETS if s in nm_wb.sheetnames]
-                    nm_auto  = first_uncolored_sheet(nm_wb, nm_avail)
-                    nm_sheet = nm_auto or nm_avail[0]
-                    nm_changes, nm_warnings = build_next_month_forecast_plan(df, nm_wb[nm_sheet])
-                    all_plans["Forecast (next month)"] = {
-                        "file_id":   nm_file_id,
-                        "file_name": nm_file_name,
-                        "wb_bytes":  nm_bytes,
-                        "sheet":     nm_sheet,
-                        "changes":   nm_changes,
-                        "warnings":  nm_warnings,
-                    }
+        next_month_dt = (datetime.date.today().replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+        nm_result, nm_err = resolve_drive_workbook(svc, hotel_id, hotel_sel, "Forecast", month_date=next_month_dt)
+        if nm_err:
+            st.warning(f"Next month Forecast: {nm_err}")
+        else:
+            nm_file_id, nm_file_name = nm_result
+            nm_bytes = drive_download(svc, nm_file_id)
+            nm_wb    = openpyxl.load_workbook(io.BytesIO(nm_bytes), data_only=False)
+            nm_avail = [s for s in FORECAST_SHEETS if s in nm_wb.sheetnames]
+            nm_auto  = first_uncolored_sheet(nm_wb, nm_avail)
+            nm_sheet = nm_auto or nm_avail[0]
+            nm_changes, nm_warnings = build_next_month_forecast_plan(df, nm_wb[nm_sheet])
+            all_plans["Forecast (next month)"] = {
+                "file_id":   nm_file_id,
+                "file_name": nm_file_name,
+                "wb_bytes":  nm_bytes,
+                "sheet":     nm_sheet,
+                "changes":   nm_changes,
+                "warnings":  nm_warnings,
+            }
 
     return all_plans
 
@@ -1118,7 +1180,7 @@ if test_mode:
             svc     = get_drive_service()
             df      = parse_csv(drive_csv.read())
             rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
-            st.session_state["drive_plans"]     = build_all_plans(svc, hotel_sel, wb_sels, df, rate_df, forecast_next_month)
+            st.session_state["drive_plans"]     = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month)
             st.session_state["drive_hotel_sel"] = hotel_sel
         except Exception as e:
             st.error(f"Drive error: {e}")
@@ -1161,7 +1223,7 @@ else:
             df      = parse_csv(drive_csv.read())
             rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
             with st.spinner("Updating workbooks in Google Drive..."):
-                all_plans       = build_all_plans(svc, hotel_sel, wb_sels, df, rate_df, forecast_next_month)
+                all_plans       = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month)
                 saved, errors   = apply_and_upload(svc, all_plans)
             for name in saved:
                 st.success(f"Saved **{name}** to Google Drive.")
