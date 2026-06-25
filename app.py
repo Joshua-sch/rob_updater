@@ -182,27 +182,49 @@ STRATEGY_CSV_COLS = {
 # Each field: list of (row3_keyword, row4_keyword) pairs to try in order.
 # Match = both keywords found (case-insensitive) in their respective rows of that column.
 # A None keyword means "don't check that row."
-# "!LY" suffix on a keyword means the column must NOT contain "LY" in either header row.
+# "!WORD" suffix(es) on a keyword mean the combined headers must NOT contain WORD.
 STRATEGY_FIELD_PATTERNS = {
-    "otb_trans":    [("OTB TY", "TRANS"),       ("TRANS!LY", "SOLD!LY")],
-    "grp_pu_ty":    [("GRP PU", "TY!LY"),       ("GROUP!LY", "SOLD!LY")],
-    "grp_npu_ty":   [("GRP N/PU", "TY!LY"),     ("GRP RMS", "N/PU"),    ("N/PU", None)],
-    "ooo_rms":      [("OOO", None)],
-    "trans_rev_ty": [("TY TRANS", "REV"),        ("TRAN", "REV TY")],
-    "grp_rev_ty":   [("GRP TY", "REV"),          ("GRP", "REV TY")],
-    "otb_lst_wk":   [("OTB LST", None),          ("LST WK", None),       ("LAST WK", None), ("LST WEK", None)],
+    # ── TY columns (written from CSV) ──────────────────────────────────────────
+    "otb_trans":       [("OTB TY", "TRANS"),            ("TRANS!LY", "SOLD!LY")],
+    "grp_pu_ty":       [("GRP PU", "TY!LY"),            ("GROUP!LY", "SOLD!LY")],
+    "grp_npu_ty":      [("GRP N/PU", "TY!LY"),          ("GRP RMS", "N/PU"),       ("N/PU!LY", None)],
+    "ooo_rms":         [("OOO", None)],
+    "trans_rev_ty":    [("TY TRANS", "REV"),             ("TRAN!LY", "REV TY")],
+    "grp_rev_ty":      [("GRP TY", "REV"),               ("GRP!LY!N/PU", "REV TY")],
+    "otb_lst_wk":      [("OTB", "LST WEK"),               ("OTB", "LST WK"),         ("OTB", "LAST WK"), ("OTB LST", None)],
+    # ── LY columns (written from last year's SR) ───────────────────────────────
+    "otb_ly_trans":    [("OTB LY", "TRANS"),             ("TRANS!TY", "SOLD!TY"),   ("LY", "TRANS!TY")],
+    "grp_pu_ly":       [("GRP PU", "LY"),                ("GROUP!TY", "LY"),        ("GRP PU LY", None)],
+    "grp_npu_ly":      [("GRP N/PU", "LY"),              ("N/PU LY", None),         ("GRP RMS", "LY")],
+    "trans_rev_ly":    [("LY TRANS", "REV"),             ("TRAN!TY", "REV LY"),     ("LY", "TRANS REV")],
+    "grp_rev_ly":      [("GRP LY", "REV"),               ("GRP!TY!N/PU", "REV LY")],
+    "grp_npu_rev_ly":  [("GRP N/PU", "REV LY"),         ("N/PU LY", "REV"),        ("N/PU", "REV LY")],
+}
+
+# Maps LY destination field → TY source field in last year's SR
+LY_FROM_TY = {
+    "otb_ly_trans":   "otb_trans",
+    "grp_pu_ly":      "grp_pu_ty",
+    "grp_npu_ly":     "grp_npu_ty",
+    "trans_rev_ly":   "trans_rev_ty",
+    "grp_rev_ly":     "grp_rev_ty",
+    "grp_npu_rev_ly": "grp_npu_ty",  # source is GRP N/PU TY
 }
 
 
 def _kw_matches(cell_val, keyword, r3_val, r4_val):
-    """Check if keyword matches cell_val. If keyword ends with !LY,
-    also verify neither r3_val nor r4_val contains 'LY'."""
-    must_not_ly = keyword.endswith("!LY")
-    kw = keyword.replace("!LY", "").strip()
-    if kw.upper() not in str(cell_val or "").upper():
+    """Check if keyword matches cell_val.
+    Supports !WORD suffixes — the combined headers must NOT contain those words.
+    e.g. 'TRAN!LY!ADR' matches if cell contains 'TRAN' and neither header contains 'LY' or 'ADR'.
+    """
+    parts = keyword.split("!")
+    kw = parts[0].strip()
+    excludes = [p.strip().upper() for p in parts[1:]]
+    if kw and kw.upper() not in str(cell_val or "").upper():
         return False
-    if must_not_ly:
-        if "LY" in str(r3_val or "").upper() or "LY" in str(r4_val or "").upper():
+    combined = (str(r3_val or "") + " " + str(r4_val or "")).upper()
+    for excl in excludes:
+        if excl in combined:
             return False
     return True
 
@@ -273,17 +295,145 @@ def detect_date_column(ws):
     return best_col
 
 
+def detect_comp_set_columns(ws, col_map):
+    """Find the comp set chart's TY (far-left) and LY (far-right) columns.
+    The chart sits between Restrictions and TY TRANS REV.
+    LY col  = last non-empty text header to the LEFT of TY TRANS REV.
+    TY col  = first non-empty text header to the RIGHT of Restrictions.
+    Scans rows 2-6 for headers (tolerates slight layout shifts).
+    Returns (ty_col, ly_col) or (None, None) if not found.
+    """
+    trans_rev_col = col_map.get("trans_rev_ty")
+    if not trans_rev_col:
+        return None, None
+
+    # Find Restrictions column — header may be split across r3/r4 (e.g. "Restric"+"tions")
+    restrict_col = None
+    for c in range(1, trans_rev_col):
+        combined_hdr = (str(ws.cell(3, c).value or "") + str(ws.cell(4, c).value or "")).upper().replace(" ", "")
+        if "RESTRICT" in combined_hdr:
+            restrict_col = c
+            break
+
+    left_bound  = (restrict_col + 1) if restrict_col else max(1, trans_rev_col - 30)
+    right_bound = trans_rev_col - 1
+
+    def _has_text_header(c):
+        for scan_r in range(2, 7):
+            v = str(ws.cell(scan_r, c).value or "").strip()
+            if v and not v.replace(".", "").isdigit():
+                return True
+        return False
+
+    # LY col: scan left from just before TY TRANS REV
+    ly_col = None
+    for c in range(right_bound, left_bound - 1, -1):
+        if _has_text_header(c):
+            ly_col = c
+            break
+
+    # TY col: scan right from just after Restrictions
+    ty_col = None
+    for c in range(left_bound, right_bound + 1):
+        if _has_text_header(c):
+            ty_col = c
+            break
+
+    if ty_col == ly_col:
+        return None, None  # same column — chart not found
+
+    return ty_col, ly_col
+
+
+def get_ly_sr_data(service, hotel_id, hotel_name, current_month, sheet_name):
+    """Fetch LY data from last year's SR (same month, same week tab).
+    Returns {date: {ly_field: value}} where dates are mapped to this year.
+    Also returns (comp_ty_col_in_ly_ws, comp_ly_col_in_current_ws_placeholder)
+    via a separate 'comp_set' key: {this_year_date: value}.
+    """
+    ly_month = current_month.replace(year=current_month.year - 1)
+    result, err = resolve_drive_workbook(service, hotel_id, hotel_name,
+                                         "Strategy Report", month_date=ly_month)
+    if err or not result:
+        return {}
+
+    file_id, _ = result
+    try:
+        file_bytes = drive_download(service, file_id)
+        ly_wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=False)
+    except Exception:
+        return {}
+
+    if sheet_name not in ly_wb.sheetnames:
+        return {}
+
+    ly_ws = ly_wb[sheet_name]
+    ly_col_map  = detect_strategy_columns(ly_ws)
+    ly_date_col = detect_date_column(ly_ws)
+
+    # Build date→row for last year's sheet
+    ly_date_row = {}
+    for r in range(5, ly_ws.max_row + 1):
+        v = ly_ws.cell(r, ly_date_col).value
+        if isinstance(v, datetime.datetime):
+            ly_date_row[v.date()] = r
+        elif isinstance(v, datetime.date):
+            ly_date_row[v] = r
+
+    # Comp set: far-left TY col in LY sheet
+    comp_ty_col, _ = detect_comp_set_columns(ly_ws, ly_col_map)
+
+    out = {}  # {this_year_date: {field: value}}
+    for ly_date, r in ly_date_row.items():
+        this_year_date = ly_date.replace(year=ly_date.year + 1)
+        row_data = {}
+
+        # Pull each TY source field from last year
+        for ly_dest_field, ty_src_field in LY_FROM_TY.items():
+            src_col = ly_col_map.get(ty_src_field)
+            if src_col:
+                v = ly_ws.cell(r, src_col).value
+                if v is not None and not is_formula(v):
+                    row_data[ly_dest_field] = safe_float(v)
+
+        # Comp set TY value (far-left hotel col in LY sheet)
+        if comp_ty_col:
+            v = ly_ws.cell(r, comp_ty_col).value
+            if v is not None and not is_formula(v):
+                row_data["comp_set_ly"] = safe_float(v)
+
+        if row_data:
+            out[this_year_date] = row_data
+
+    return out
+
+
 def build_date_row_map(wb):
-    """Build {date: row_number} from WKONE using auto-detected date column."""
+    """Build {date: row_number} from WKONE using auto-detected date column.
+    When subsequent rows contain formulas (=C5+1 style), extrapolates from the
+    first real date so the full year is mapped correctly.
+    """
     ws = wb["WKONE"]
     date_col = detect_date_column(ws)
     mapping = {}
+    anchor_date = None
+    anchor_row  = None
     for row_num in range(5, ws.max_row + 1):
         val = ws.cell(row_num, date_col).value
         if isinstance(val, datetime.datetime):
-            mapping[val.date()] = row_num
+            d = val.date()
         elif isinstance(val, datetime.date):
-            mapping[val] = row_num
+            d = val
+        elif anchor_date and isinstance(val, str) and val.startswith("="):
+            # Formula row — extrapolate from anchor
+            offset = row_num - anchor_row
+            d = anchor_date + datetime.timedelta(days=offset)
+        else:
+            continue
+        if anchor_date is None:
+            anchor_date = d
+            anchor_row  = row_num
+        mapping[d] = row_num
     return mapping
 
 
@@ -302,25 +452,111 @@ def find_otb_date_cell(ws):
     return 2, 4  # fallback
 
 
-def build_strategy_change_plan(df, wb, sheet_name, drive_service=None, hotel_id=None, hotel_name=None):
+def _extract_otb_trans_by_date(wb, sheet_name, from_date):
+    """Read OTB TY Trans keyed by date from an in-memory workbook.
+    Uses build_date_row_map for date→row resolution so formula-based date
+    cells (=C5+1 style) are handled via anchor extrapolation.
+    Only returns rows where date >= from_date.
+    """
+    if sheet_name not in wb.sheetnames:
+        return {}
+    ws = wb[sheet_name]
+    col_map = detect_strategy_columns(ws)
+    otb_col = col_map.get("otb_trans")
+    if not otb_col:
+        return {}
+    date_row_map = build_date_row_map(wb)  # reads WKONE, handles formula dates
+    out = {}
+    for d, r in date_row_map.items():
+        if d < from_date:
+            continue
+        val = ws.cell(r, otb_col).value
+        if val is not None and not is_formula(val):
+            out[d] = safe_float(val)
+    return out
+
+
+def _extract_ly_data_from_wb(ly_wb, sheet_name):
+    """Read all LY source fields + comp set TY col from an in-memory workbook.
+    Returns {this_year_date: {field: value}} (dates shifted +1 year).
+    """
+    if sheet_name not in ly_wb.sheetnames:
+        return {}
+    ws = ly_wb[sheet_name]
+    col_map  = detect_strategy_columns(ws)
+    date_col = detect_date_column(ws)
+    comp_ty_col, _ = detect_comp_set_columns(ws, col_map)
+
+    out = {}
+    for r in range(5, ws.max_row + 1):
+        v = ws.cell(r, date_col).value
+        if isinstance(v, datetime.datetime): d = v.date()
+        elif isinstance(v, datetime.date):   d = v
+        else: continue
+        this_year = d.replace(year=d.year + 1)
+        row_data = {}
+        for ly_dest, ty_src in LY_FROM_TY.items():
+            src_col = col_map.get(ty_src)
+            if src_col:
+                val = ws.cell(r, src_col).value
+                if val is not None and not is_formula(val):
+                    row_data[ly_dest] = safe_float(val)
+        if comp_ty_col:
+            val = ws.cell(r, comp_ty_col).value
+            if val is not None and not is_formula(val):
+                row_data["comp_set_ly"] = safe_float(val)
+        if row_data:
+            out[this_year] = row_data
+    return out
+
+
+def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=None,
+                               scope_start=None, scope_end=None):
+    """Build strategy changes.
+    prev_month_wb: in-memory previous month's SR workbook (for OTB Lst Wek on WKONE)
+    ly_wb:         in-memory last year's SR workbook (for all LY columns, every week)
+    """
     today = datetime.date.today()
-    scope_start = today.replace(day=1)
-    scope_end = datetime.date(today.year, 12, 31)
+    if scope_start is None:
+        scope_start = today.replace(day=1)
+    if scope_end is None:
+        scope_end = datetime.date(today.year + 1, 12, 31)
 
     date_row_map = build_date_row_map(wb)
     ws = wb[sheet_name]
 
     # Detect actual column positions from headers — no guessing
     col_map = detect_strategy_columns(ws)
-    missing = [f for f, c in col_map.items() if c is None
-               and f != "otb_lst_wk"]  # otb_lst_wk only expected on WKONE
+    ly_only_fields = {"otb_lst_wk", "otb_ly_trans", "grp_pu_ly", "grp_npu_ly",
+                      "trans_rev_ly", "grp_rev_ly", "grp_npu_rev_ly"}
+    missing = [f for f, c in col_map.items() if c is None and f not in ly_only_fields]
     if missing:
         st.warning(f"Strategy: could not locate columns for: {', '.join(missing)}")
 
-    # For WKONE, pull OTB Lst Wek from previous month's SR
+    # Comp set columns in current sheet
+    comp_ty_col_cur, comp_ly_col_cur = detect_comp_set_columns(ws, col_map)
+
+    # OTB Lst Wek — WKONE only, from previous month's SR (already in memory)
     prev_otb_map = {}
-    if sheet_name == "WKONE" and col_map.get("otb_lst_wk") and drive_service and hotel_id:
-        prev_otb_map = get_prev_month_otb_trans(drive_service, hotel_id, hotel_name or "", scope_start)
+    src_sheet = None
+    if sheet_name == "WKONE" and col_map.get("otb_lst_wk") and prev_month_wb:
+        prev_sheet = first_uncolored_sheet(prev_month_wb, STRATEGY_SHEETS)
+        # Use last FILLED tab (opposite of first_uncolored — last colored tab)
+        last_filled = None
+        for s in STRATEGY_SHEETS:
+            if s in prev_month_wb.sheetnames:
+                tc = prev_month_wb[s].sheet_properties.tabColor
+                if tc is not None:
+                    last_filled = s
+        src_sheet = last_filled or (STRATEGY_SHEETS[-1] if STRATEGY_SHEETS[-1] in prev_month_wb.sheetnames else None)
+        if src_sheet:
+            prev_otb_map = _extract_otb_trans_by_date(prev_month_wb, src_sheet, scope_start)
+
+    # LY data — every week, from last year's same month/week tab (already in memory)
+    ly_data = {}
+    if ly_wb:
+        ly_data = _extract_ly_data_from_wb(ly_wb, sheet_name)
+
 
     changes = []
 
@@ -333,7 +569,48 @@ def build_strategy_change_plan(df, wb, sheet_name, drive_service=None, hotel_id=
             "skip_reason": "formula" if is_formula(ws.cell(date_row, date_col).value) else None,
         })
 
-    for _, row in df.iterrows():
+    # As-of date above OTB Lst Wek header (row above row 3, i.e. row 2)
+    lst_wk_col = col_map.get("otb_lst_wk")
+    if lst_wk_col and prev_month_wb and src_sheet:
+        prev_ws = prev_month_wb[src_sheet]
+        prev_date_row, _ = find_otb_date_cell(prev_ws)
+        src_date = prev_ws.cell(prev_date_row, date_col).value if prev_date_row >= 1 else None
+        if src_date is None:
+            # fallback: look in row above the lst_wk header in source
+            for hr in range(2, 6):
+                if str(prev_ws.cell(hr, lst_wk_col).value or "").strip():
+                    src_date = prev_ws.cell(hr - 1, lst_wk_col).value
+                    break
+        if src_date:
+            hdr_row = next((r for r in range(2, 6) if str(ws.cell(r, lst_wk_col).value or "").strip()), 3)
+            label_row = hdr_row - 1
+            if label_row >= 1:
+                changes.append({
+                    "date": None, "row": label_row, "col": lst_wk_col,
+                    "label": "OTB Lst Wek as-of date",
+                    "new_value": src_date,
+                    "skip_reason": "formula" if is_formula(ws.cell(label_row, lst_wk_col).value) else None,
+                })
+
+    # As-of date above OTB LY TRANS header
+    ly_trans_col = col_map.get("otb_ly_trans")
+    if ly_trans_col and ly_wb and sheet_name in ly_wb.sheetnames:
+        ly_ws_src = ly_wb[sheet_name]
+        ly_date_row, _ = find_otb_date_cell(ly_ws_src)
+        ly_src_date = ly_ws_src.cell(ly_date_row, date_col).value if ly_date_row >= 1 else None
+        if ly_src_date:
+            hdr_row = next((r for r in range(2, 6) if str(ws.cell(r, ly_trans_col).value or "").strip()), 3)
+            label_row = hdr_row - 1
+            if label_row >= 1:
+                changes.append({
+                    "date": None, "row": label_row, "col": ly_trans_col,
+                    "label": "OTB LY Trans as-of date",
+                    "new_value": ly_src_date,
+                    "skip_reason": "formula" if is_formula(ws.cell(label_row, ly_trans_col).value) else None,
+                })
+
+    # ── CSV-sourced TY columns (only when BOB uploaded) ──────────────────────
+    for _, row in (df.iterrows() if df is not None else []):
         date_str = str(row[0]).strip() if row[0] else ""
         kind, info = classify_row(date_str)
         if kind != "daily":
@@ -343,12 +620,11 @@ def build_strategy_change_plan(df, wb, sheet_name, drive_service=None, hotel_id=
             continue
         if d not in date_row_map:
             continue
-
         excel_row = date_row_map[d]
         for field, (csv_col, label) in STRATEGY_CSV_COLS.items():
             excel_col = col_map.get(field)
             if excel_col is None:
-                continue  # column not found in this sheet — already warned above
+                continue
             val = safe_float(row[csv_col])
             skip = "formula" if is_formula(ws.cell(excel_row, excel_col).value) else None
             changes.append({
@@ -356,7 +632,14 @@ def build_strategy_change_plan(df, wb, sheet_name, drive_service=None, hotel_id=
                 "label": label, "new_value": val, "skip_reason": skip,
             })
 
-        # OTB Lst Wek — WKONE only, sourced from previous month's SR
+    # ── Drive-sourced columns (run every time, no CSV needed) ─────────────────
+    all_dates = set(date_row_map.keys()) & (set(prev_otb_map) | set(ly_data))
+    for d in sorted(all_dates):
+        if d < scope_start or d > scope_end:
+            continue
+        excel_row = date_row_map[d]
+
+        # OTB Lst Wek — WKONE only
         lst_wk_col = col_map.get("otb_lst_wk")
         if lst_wk_col and d in prev_otb_map:
             skip = "formula" if is_formula(ws.cell(excel_row, lst_wk_col).value) else None
@@ -364,6 +647,33 @@ def build_strategy_change_plan(df, wb, sheet_name, drive_service=None, hotel_id=
                 "date": d, "row": excel_row, "col": lst_wk_col,
                 "label": "OTB Lst Wek", "new_value": prev_otb_map[d], "skip_reason": skip,
             })
+
+        # LY columns
+        if d in ly_data:
+            row_ly = ly_data[d]
+            for ly_field, ly_label in [
+                ("otb_ly_trans",   "OTB LY Trans"),
+                ("grp_pu_ly",      "GRP PU LY"),
+                ("grp_npu_ly",     "GRP N/PU LY"),
+                ("trans_rev_ly",   "LY Trans Rev"),
+                ("grp_rev_ly",     "GRP LY Rev"),
+                ("grp_npu_rev_ly", "GRP N/PU LY Rev"),
+            ]:
+                dest_col = col_map.get(ly_field)
+                if dest_col and ly_field in row_ly:
+                    skip = "formula" if is_formula(ws.cell(excel_row, dest_col).value) else None
+                    changes.append({
+                        "date": d, "row": excel_row, "col": dest_col,
+                        "label": ly_label, "new_value": row_ly[ly_field], "skip_reason": skip,
+                    })
+
+            # Comp set far-right (LY) ← far-left (TY) from last year
+            if comp_ly_col_cur and "comp_set_ly" in row_ly:
+                skip = "formula" if is_formula(ws.cell(excel_row, comp_ly_col_cur).value) else None
+                changes.append({
+                    "date": d, "row": excel_row, "col": comp_ly_col_cur,
+                    "label": "Comp Set LY", "new_value": row_ly["comp_set_ly"], "skip_reason": skip,
+                })
 
     return changes
 
@@ -853,14 +1163,22 @@ def drive_find_or_create_month_folder(service, rev_id: str, year_id: str, month_
         "mimeType": "application/vnd.google-apps.folder",
         "parents": [year_id],
     }
-    created = service.files().create(body=folder_meta, fields="id,name").execute()
+    created = service.files().create(
+        body=folder_meta, fields="id,name", supportsAllDrives=True,
+    ).execute()
     return created["id"], created["name"]
 
 
 def drive_copy_file(service, source_file_id: str, new_name: str, parent_folder_id: str):
-    """Copy a Drive file to a new name in the given folder. Returns (new_file_id, new_name)."""
+    """Copy a Drive file to a new name in the given folder. Returns (new_file_id, new_name).
+    supportsAllDrives=True is required when the destination is a shared drive —
+    service accounts have no personal storage quota.
+    """
     body = {"name": new_name, "parents": [parent_folder_id]}
-    copied = service.files().copy(fileId=source_file_id, body=body, fields="id,name").execute()
+    copied = service.files().copy(
+        fileId=source_file_id, body=body, fields="id,name",
+        supportsAllDrives=True,
+    ).execute()
     return copied["id"], copied["name"]
 
 
@@ -924,7 +1242,10 @@ def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: da
             hotel_suffix = master_name[master_name.upper().find("STRATEGY") + len("STRATEGY"):].strip().replace(".xlsx", "").replace(".XLSX", "").strip()
 
     new_file_name = f"{month_kw} STRATEGY {hotel_suffix}.xlsx"
-    _, created_name = drive_copy_file(service, master_id, new_file_name, month_id)
+    try:
+        _, created_name = drive_copy_file(service, master_id, new_file_name, month_id)
+    except Exception as e:
+        return None, str(e)
     return created_name, None
 
 
@@ -1020,6 +1341,46 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
     return (file_id, file_name), None
 
 
+DOW_ABBREVS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+
+
+def restructure_sr_dates(wb, target_month):
+    """Restructure the three date columns in every strategy sheet for a new month.
+    Col 1 (LY date):   starts at day 2 of target_month, last year  → 365 rows
+    Col 2 (day of wk): abbreviation matching the TY date in col 3  → 365 rows
+    Col 3 (TY date):   starts at day 1 of target_month, this year  → 365 rows
+    """
+    ty_start = target_month                                          # e.g. 2026-07-01
+    ly_start = datetime.date(ty_start.year - 1, ty_start.month, 2) # e.g. 2025-07-02
+
+    for sheet_name in STRATEGY_SHEETS:
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        for i in range(365):
+            row     = 5 + i
+            ty_date = ty_start + datetime.timedelta(days=i)
+            ly_date = ly_start + datetime.timedelta(days=i)
+            dow     = DOW_ABBREVS[ty_date.weekday()]
+            ws.cell(row, 1).value = datetime.datetime(ly_date.year, ly_date.month, ly_date.day)
+            ws.cell(row, 2).value = dow
+            ws.cell(row, 3).value = datetime.datetime(ty_date.year, ty_date.month, ty_date.day)
+
+
+def _load_wb_from_drive(svc, hotel_id, hotel_name, wb_type, month_date, data_only=True):
+    """Download and parse a workbook from Drive. Returns openpyxl.Workbook or None.
+    data_only=True (default) returns cached cell values — use for reference workbooks.
+    data_only=False preserves formulas — use for workbooks we intend to write back.
+    """
+    result, err = resolve_drive_workbook(svc, hotel_id, hotel_name, wb_type, month_date=month_date)
+    if err or not result:
+        return None
+    try:
+        return openpyxl.load_workbook(io.BytesIO(drive_download(svc, result[0])), data_only=data_only)
+    except Exception:
+        return None
+
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Linchris Weekly Tools", layout="wide")
@@ -1030,10 +1391,11 @@ def check_login(username: str, password: str) -> bool:
     correct_hash = st.secrets["auth"]["password_hash"].encode()
     return username == correct_user and bcrypt.checkpw(password.encode(), correct_hash)
 
+LOGIN_ENABLED = True
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 
-if not st.session_state["authenticated"]:
+if LOGIN_ENABLED and not st.session_state["authenticated"]:
     st.title("Linchris Hotel Corporation")
     st.subheader("Please log in to continue")
     with st.form("login_form"):
@@ -1373,26 +1735,106 @@ if "Forecast" in (wb_sels or []):
 start_new_month = st.checkbox("Start new month", key="drive_new_month")
 if start_new_month:
     with st.container(border=True):
-        st.markdown("**New Month Setup**")
+        st.markdown("**New Month Setup — Strategy Report**")
         next_month_dt = (datetime.date.today().replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
-        st.caption(f"Target month: **{next_month_dt.strftime('%B %Y')}**")
-        new_month_hotel = hotel_sel
-        if st.button("Set Up Strategy Report for New Month", key="btn_new_month_sr"):
+        month_kw      = next_month_dt.strftime("%b%Y").upper()
+        st.caption(
+            f"Target: **{next_month_dt.strftime('%B %Y')}** · "
+            f"Creates the workbook (if needed) and fills all 5 weeks of LY + historical data in one shot."
+        )
+
+        if st.button("Set Up New Workbook", key="btn_setup_new_wb", type="primary"):
             try:
-                svc = get_drive_service()
-                hotel_id_nm = hotel_id_map.get(new_month_hotel, "")
-                with st.spinner(f"Setting up {next_month_dt.strftime('%b %Y')} SR for {new_month_hotel}..."):
-                    created_name, err = setup_new_sr_month(svc, hotel_id_nm, new_month_hotel, next_month_dt)
-                if err:
-                    st.error(f"New month setup failed: {err}")
-                else:
-                    st.success(f"Created **{created_name}** in Drive — ready for {next_month_dt.strftime('%B %Y')}.")
+                svc         = get_drive_service()
+                hotel_id_nm = hotel_id_map.get(hotel_sel, "")
+
+                # Step 1 — ensure the file exists; skip copy if it's already there
+                with st.spinner("Step 1 / 3 — locating or creating workbook..."):
+                    existing, find_err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
+                                                          "Strategy Report", month_date=next_month_dt)
+                    if existing:
+                        st.info(f"Found existing file: **{existing[1]}** — skipping copy.")
+                        created_name, create_err = setup_new_sr_month(svc, hotel_id_nm, hotel_sel, next_month_dt)
+                        if create_err:
+                            master_id, master_name = find_sr_master(svc, hotel_id_nm)
+                            hotel_suffix = ""
+                            if master_name and "STRATEGY" in master_name.upper():
+                                hotel_suffix = master_name[master_name.upper().find("STRATEGY") + len("STRATEGY"):].strip().replace(".xlsx","").replace(".XLSX","").strip()
+                            suggested_name = f"{month_kw} STRATEGY {hotel_suffix}.xlsx".strip()
+                            if "storageQuotaExceeded" in str(create_err):
+                                st.warning(
+                                    f"Auto-copy requires a Shared Drive. Do this in Google Drive first:\n\n"
+                                    f"1. Right-click **{master_name or 'the SR master'}** → *Make a copy*\n"
+                                    f"2. Rename to: **`{suggested_name}`**\n"
+                                    f"3. Move into the **{month_kw}** folder\n\n"
+                                    f"Then click **Set Up New Workbook** again."
+                                )
+                            else:
+                                st.error(f"Could not create workbook: {create_err}")
+                            st.stop()
+
+                # Step 2 — load reference workbooks into memory
+                with st.spinner("Step 2 / 3 — loading reference workbooks..."):
+                    prev_month_dt    = (next_month_dt - datetime.timedelta(days=1)).replace(day=1)
+                    ly_month_dt      = next_month_dt.replace(year=next_month_dt.year - 1)
+                    prev_month_sr_wb = _load_wb_from_drive(svc, hotel_id_nm, hotel_sel, "Strategy Report", prev_month_dt, data_only=False)
+                    ly_sr_wb         = _load_wb_from_drive(svc, hotel_id_nm, hotel_sel, "Strategy Report", ly_month_dt)
+                st.info(f"Prev month ({prev_month_dt.strftime('%b %Y')}): {'✓' if prev_month_sr_wb else '✗ not found'}")
+                st.info(f"Last year  ({ly_month_dt.strftime('%b %Y')}): {'✓' if ly_sr_wb else '✗ not found'}")
+
+                # Step 3 — populate all 5 weeks
+                with st.spinner("Step 3 / 3 — populating all weeks..."):
+                    result, err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
+                                                         "Strategy Report", month_date=next_month_dt)
+                    if err:
+                        st.error(f"Cannot open new workbook: {err}")
+                        st.stop()
+                    file_id, file_name = result
+                    wb_bytes = drive_download(svc, file_id)
+                    wb       = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
+                    restructure_sr_dates(wb, next_month_dt)
+                    full_scope_start = next_month_dt
+                    full_scope_end   = next_month_dt + datetime.timedelta(days=364)
+                    total_written = 0
+                    for sheet_name in STRATEGY_SHEETS:
+                        if sheet_name not in wb.sheetnames:
+                            continue
+                        changes = build_strategy_change_plan(None, wb, sheet_name,
+                                                              prev_month_wb=prev_month_sr_wb,
+                                                              ly_wb=ly_sr_wb,
+                                                              scope_start=full_scope_start,
+                                                              scope_end=full_scope_end)
+                        apply_strategy_changes(wb, sheet_name, changes)
+                        total_written += len([c for c in changes if not c.get("skip_reason")])
+                    strip_tables(wb)
+                    out = io.BytesIO()
+                    wb.save(out)
+                    drive_upload(svc, file_id, out.getvalue(), file_name)
+
+                st.success(
+                    f"**{file_name}** is set up for {next_month_dt.strftime('%B %Y')}. "
+                    f"Populated **{total_written}** cells across all weeks."
+                )
             except Exception as e:
-                st.error(f"New month setup error: {e}")
+                st.error(f"Setup error: {e}")
+
+
 
 
 def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_next_month=False):
+    today = datetime.date.today()
+    current_month = today.replace(day=1)
     all_plans = {}
+
+    # Pre-load reference workbooks into memory once — used for cross-sheet lookups
+    prev_month_sr_wb = None
+    ly_sr_wb         = None
+    if "Strategy Report" in wb_sels:
+        prev_month_dt = (current_month - datetime.timedelta(days=1)).replace(day=1)
+        ly_month_dt   = current_month.replace(year=current_month.year - 1)
+        prev_month_sr_wb = _load_wb_from_drive(svc, hotel_id, hotel_sel, "Strategy Report", prev_month_dt, data_only=False)
+        ly_sr_wb         = _load_wb_from_drive(svc, hotel_id, hotel_sel, "Strategy Report", ly_month_dt)
+
     for wb_type in wb_sels:
         result, err = resolve_drive_workbook(svc, hotel_id, hotel_sel, wb_type)
         if err:
@@ -1411,7 +1853,9 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
             avail    = [s for s in STRATEGY_SHEETS if s in wb.sheetnames]
             auto     = first_uncolored_sheet(wb, avail)
             sheet    = auto or avail[0]
-            changes  = build_strategy_change_plan(df, wb, sheet, drive_service=svc, hotel_id=hotel_id, hotel_name=hotel_sel)
+            changes  = build_strategy_change_plan(df, wb, sheet,
+                                                   prev_month_wb=prev_month_sr_wb,
+                                                   ly_wb=ly_sr_wb)
             warnings = []
             if rate_df is not None:
                 rate_changes, rate_warnings = build_rates_change_plan(rate_df, wb, sheet)
@@ -1486,7 +1930,7 @@ if test_mode:
     if ready and st.button("Preview Changes", key="drive_preview"):
         try:
             svc     = get_drive_service()
-            df      = parse_csv(drive_csv.read())
+            df      = parse_csv(drive_csv.read()) if drive_csv else None
             rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
             st.session_state["drive_plans"]     = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month)
             st.session_state["drive_hotel_sel"] = hotel_sel
@@ -1528,7 +1972,7 @@ else:
     if ready and st.button("Upload Data to Workbooks", key="drive_go", type="primary"):
         try:
             svc     = get_drive_service()
-            df      = parse_csv(drive_csv.read())
+            df      = parse_csv(drive_csv.read()) if drive_csv else None
             rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
             with st.spinner("Updating workbooks in Google Drive..."):
                 all_plans       = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month)
