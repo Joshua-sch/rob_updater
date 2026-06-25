@@ -191,6 +191,20 @@ def build_date_row_map(wb):
     return mapping
 
 
+def find_otb_date_cell(ws):
+    """Find the cell that holds the as-of date above the OTB TY TRANS header.
+    Scans for a column where consecutive rows contain 'OTB TY' then 'TRANS'
+    and returns (row-above, col). Falls back to (2, 4) if not found.
+    """
+    for r in range(1, 20):
+        for c in range(1, ws.max_column + 1):
+            v = str(ws.cell(r, c).value or "").strip().upper()
+            v_next = str(ws.cell(r + 1, c).value or "").strip().upper()
+            if v == "OTB TY" and v_next == "TRANS":
+                return r - 1, c
+    return 2, 4  # fallback
+
+
 def build_strategy_change_plan(df, wb, sheet_name):
     today = datetime.date.today()
     scope_start = today.replace(day=1)
@@ -199,6 +213,15 @@ def build_strategy_change_plan(df, wb, sheet_name):
     date_row_map = build_date_row_map(wb)
     ws = wb[sheet_name]
     changes = []
+
+    # Today's date above the OTB TY TRANS header
+    date_row, date_col = find_otb_date_cell(ws)
+    if date_row >= 1:
+        changes.append({
+            "date": today, "row": date_row, "col": date_col,
+            "label": "As-of date", "new_value": today,
+            "skip_reason": "formula" if is_formula(ws.cell(date_row, date_col).value) else None,
+        })
 
     for _, row in df.iterrows():
         date_str = str(row[0]).strip() if row[0] else ""
@@ -989,8 +1012,11 @@ drive_csv = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"],
 drive_rate_csv = None
 if "Strategy Report" in (wb_sels or []):
     drive_rate_csv = st.file_uploader("Upload Rates & Restrictions CSV", type=["csv"], key="drive_rate_csv")
+forecast_next_month = False
+if "Forecast" in (wb_sels or []):
+    forecast_next_month = st.checkbox("Forecast next month as well?", key="drive_fcst_next")
 
-def build_all_plans(svc, hotel_sel, wb_sels, df, rate_df):
+def build_all_plans(svc, hotel_sel, wb_sels, df, rate_df, forecast_next_month=False):
     all_plans = {}
     for wb_type in wb_sels:
         result, err = resolve_drive_workbook(svc, hotel_sel, wb_type)
@@ -1016,7 +1042,7 @@ def build_all_plans(svc, hotel_sel, wb_sels, df, rate_df):
                 rate_changes, rate_warnings = build_rates_change_plan(rate_df, wb, sheet)
                 changes  += rate_changes
                 warnings += rate_warnings
-        else:  # Forecast
+        else:  # Forecast — current month
             avail    = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
             auto     = first_uncolored_sheet(wb, avail)
             sheet    = auto or avail[0]
@@ -1029,6 +1055,35 @@ def build_all_plans(svc, hotel_sel, wb_sels, df, rate_df):
             "changes":   changes,
             "warnings":  warnings,
         }
+
+    # Next-month Forecast: only when checkbox is ticked
+    if "Forecast" in wb_sels and forecast_next_month:
+        today         = datetime.date.today()
+        next_month_dt = (today.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+        next_month_kw = next_month_dt.strftime("%b%Y").upper()   # e.g. "JUL2026"
+        hotel_kw      = HOTEL_FOLDER_KEYWORDS[hotel_sel]
+
+        hotel_id, _ = drive_find_folder_by_keyword(svc, hotel_kw)
+        if hotel_id:
+            nm_folder_id, nm_folder_name = drive_find_folder_by_keyword(svc, next_month_kw, parent_id=hotel_id)
+            if nm_folder_id:
+                nm_file_id, nm_file_name = drive_find_file(svc, WORKBOOK_KEYWORDS["Forecast"], nm_folder_id)
+                if nm_file_id:
+                    nm_bytes = drive_download(svc, nm_file_id)
+                    nm_wb    = openpyxl.load_workbook(io.BytesIO(nm_bytes), data_only=False)
+                    nm_avail = [s for s in FORECAST_SHEETS if s in nm_wb.sheetnames]
+                    nm_auto  = first_uncolored_sheet(nm_wb, nm_avail)
+                    nm_sheet = nm_auto or nm_avail[0]
+                    nm_changes, nm_warnings = build_next_month_forecast_plan(df, nm_wb[nm_sheet])
+                    all_plans["Forecast (next month)"] = {
+                        "file_id":   nm_file_id,
+                        "file_name": nm_file_name,
+                        "wb_bytes":  nm_bytes,
+                        "sheet":     nm_sheet,
+                        "changes":   nm_changes,
+                        "warnings":  nm_warnings,
+                    }
+
     return all_plans
 
 
@@ -1063,7 +1118,7 @@ if test_mode:
             svc     = get_drive_service()
             df      = parse_csv(drive_csv.read())
             rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
-            st.session_state["drive_plans"]     = build_all_plans(svc, hotel_sel, wb_sels, df, rate_df)
+            st.session_state["drive_plans"]     = build_all_plans(svc, hotel_sel, wb_sels, df, rate_df, forecast_next_month)
             st.session_state["drive_hotel_sel"] = hotel_sel
         except Exception as e:
             st.error(f"Drive error: {e}")
@@ -1106,7 +1161,7 @@ else:
             df      = parse_csv(drive_csv.read())
             rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
             with st.spinner("Updating workbooks in Google Drive..."):
-                all_plans       = build_all_plans(svc, hotel_sel, wb_sels, df, rate_df)
+                all_plans       = build_all_plans(svc, hotel_sel, wb_sels, df, rate_df, forecast_next_month)
                 saved, errors   = apply_and_upload(svc, all_plans)
             for name in saved:
                 st.success(f"Saved **{name}** to Google Drive.")
