@@ -1036,23 +1036,26 @@ def get_hotels_from_drive():
     """
     try:
         svc = get_drive_service()
-        # All folders visible to the service account
         q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        result = svc.files().list(q=q, fields="files(id, name)", pageSize=100).execute()
+        result = svc.files().list(
+            q=q, fields="files(id, name)", pageSize=200,
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
+        ).execute()
         folders = result.get("files", [])
 
         hotels = []
         for folder in folders:
             name = folder["name"]
-            # Skip revenue report folders, year folders, month folders
             if "REVENUE REPORTS" in name.upper():
                 continue
             if re.search(r'\b20\d{2}\b', name):
                 continue
-            # Must have a child folder containing "REVENUE REPORTS"
             child_q = ("'%s' in parents and trashed = false and "
                        "mimeType = 'application/vnd.google-apps.folder'") % folder["id"]
-            children = svc.files().list(q=child_q, fields="files(name)", pageSize=20).execute()
+            children = svc.files().list(
+                q=child_q, fields="files(name)", pageSize=20,
+                supportsAllDrives=True, includeItemsFromAllDrives=True,
+            ).execute()
             has_rev = any("REVENUE REPORTS" in c["name"].upper() for c in children.get("files", []))
             if has_rev:
                 hotels.append((name, folder["id"]))
@@ -1344,20 +1347,34 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
 DOW_ABBREVS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 
 
+def _count_sheet_data_rows(ws):
+    """Count how many data rows exist from row 5 downward by finding the last
+    row that has any non-empty content across the first 10 columns."""
+    last_row = 4
+    for r in range(5, ws.max_row + 1):
+        if any(ws.cell(r, c).value is not None for c in range(1, 11)):
+            last_row = r
+    return max(0, last_row - 4)  # number of rows starting from row 5
+
+
 def restructure_sr_dates(wb, target_month):
     """Restructure the three date columns in every strategy sheet for a new month.
-    Col 1 (LY date):   starts at day 2 of target_month, last year  → 365 rows
-    Col 2 (day of wk): abbreviation matching the TY date in col 3  → 365 rows
-    Col 3 (TY date):   starts at day 1 of target_month, this year  → 365 rows
+    Col 1 (LY date):   starts at day 2 of target_month, last year
+    Col 2 (day of wk): abbreviation matching the TY date in col 3
+    Col 3 (TY date):   starts at day 1 of target_month, this year
+    Row count matches the master — hotels open only part of the year have fewer rows.
     """
-    ty_start = target_month                                          # e.g. 2026-07-01
-    ly_start = datetime.date(ty_start.year - 1, ty_start.month, 2) # e.g. 2025-07-02
+    ty_start = target_month
+    ly_start = datetime.date(ty_start.year - 1, ty_start.month, 2)
 
     for sheet_name in STRATEGY_SHEETS:
         if sheet_name not in wb.sheetnames:
             continue
         ws = wb[sheet_name]
-        for i in range(365):
+        num_rows = _count_sheet_data_rows(ws)
+        if num_rows == 0:
+            continue
+        for i in range(num_rows):
             row     = 5 + i
             ty_date = ty_start + datetime.timedelta(days=i)
             ly_date = ly_start + datetime.timedelta(days=i)
@@ -1713,9 +1730,14 @@ hotels = get_hotels_from_drive()
 hotel_names = [h[0] for h in hotels]
 hotel_id_map = {h[0]: h[1] for h in hotels}
 
-col_h, col_w = st.columns(2)
+col_h, col_ref, col_w = st.columns([3, 1, 3])
 with col_h:
     hotel_sel = st.selectbox("Hotel", hotel_names if hotel_names else ["(no hotels found)"], key="drive_hotel")
+with col_ref:
+    st.write("")
+    if st.button("↺ Refresh", key="refresh_hotels"):
+        get_hotels_from_drive.clear()
+        st.rerun()
 with col_w:
     wb_sels = st.multiselect(
         "Workbooks to update",
@@ -1791,10 +1813,13 @@ if start_new_month:
                         st.stop()
                     file_id, file_name = result
                     wb_bytes = drive_download(svc, file_id)
+                    original_bytes = wb_bytes  # snapshot before any changes
                     wb       = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
                     restructure_sr_dates(wb, next_month_dt)
+                    first_ws = wb[STRATEGY_SHEETS[0]] if STRATEGY_SHEETS[0] in wb.sheetnames else None
+                    num_rows = _count_sheet_data_rows(first_ws) if first_ws else 365
                     full_scope_start = next_month_dt
-                    full_scope_end   = next_month_dt + datetime.timedelta(days=364)
+                    full_scope_end   = next_month_dt + datetime.timedelta(days=max(0, num_rows - 1))
                     total_written = 0
                     for sheet_name in STRATEGY_SHEETS:
                         if sheet_name not in wb.sheetnames:
@@ -1810,6 +1835,11 @@ if start_new_month:
                     out = io.BytesIO()
                     wb.save(out)
                     drive_upload(svc, file_id, out.getvalue(), file_name)
+                    st.session_state["setup_undo"] = {
+                        "file_id":   file_id,
+                        "file_name": file_name,
+                        "bytes":     original_bytes,
+                    }
 
                 st.success(
                     f"**{file_name}** is set up for {next_month_dt.strftime('%B %Y')}. "
@@ -1817,6 +1847,21 @@ if start_new_month:
                 )
             except Exception as e:
                 st.error(f"Setup error: {e}")
+
+        # Reset button — shown after a successful setup
+        if "setup_undo" in st.session_state:
+            st.divider()
+            st.warning("Last setup can be reset — this will restore the workbook to its original state.")
+            if st.button("↩ Reset Workbook to Original", key="setup_reset", type="secondary"):
+                try:
+                    info = st.session_state["setup_undo"]
+                    with st.spinner("Restoring original workbook..."):
+                        get_drive_service()  # ensure auth
+                        drive_upload(get_drive_service(), info["file_id"], info["bytes"], info["file_name"])
+                    del st.session_state["setup_undo"]
+                    st.success(f"**{info['file_name']}** restored to original state.")
+                except Exception as e:
+                    st.error(f"Reset error: {e}")
 
 
 
@@ -1901,11 +1946,31 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
     return all_plans
 
 
+def _snapshot_changes(wb, sheet_name, changes):
+    """Return {(sheet, row, col): original_value} for every cell in the change plan."""
+    ws = wb[sheet_name]
+    return {
+        (sheet_name, ch["row"], ch["col"]): ws.cell(ch["row"], ch["col"]).value
+        for ch in changes
+        if not ch.get("skip_reason")
+    }
+
+
 def apply_and_upload(svc, all_plans):
     saved, errors = [], []
+    undo_snapshot = {}  # cumulative snapshot across all workbooks
     for wb_type, plan in all_plans.items():
         try:
             wb_apply = openpyxl.load_workbook(io.BytesIO(plan["wb_bytes"]), data_only=False)
+            # Snapshot originals BEFORE writing
+            snap = _snapshot_changes(wb_apply, plan["sheet"], plan["changes"])
+            undo_snapshot[wb_type] = {
+                "file_id":   plan["file_id"],
+                "file_name": plan["file_name"],
+                "wb_bytes":  plan["wb_bytes"],   # clean pre-write bytes
+                "sheet":     plan["sheet"],
+                "cells":     snap,
+            }
             if wb_type == "ROB":
                 apply_rob_changes(wb_apply, plan["sheet"], plan["changes"])
             elif wb_type == "Strategy Report":
@@ -1920,6 +1985,32 @@ def apply_and_upload(svc, all_plans):
             saved.append(plan["file_name"])
         except Exception as e:
             errors.append(f"{wb_type}: {e}")
+    if saved:
+        st.session_state["undo_snapshot"] = undo_snapshot
+    return saved, errors
+
+
+def undo_all_changes(svc):
+    """Restore every snapshotted cell to its original value and re-upload."""
+    snapshot = st.session_state.get("undo_snapshot", {})
+    if not snapshot:
+        return [], ["No snapshot found — nothing to undo."]
+    saved, errors = [], []
+    for wb_type, info in snapshot.items():
+        try:
+            wb = openpyxl.load_workbook(io.BytesIO(info["wb_bytes"]), data_only=False)
+            ws = wb[info["sheet"]]
+            for (sheet, row, col), orig_val in info["cells"].items():
+                ws.cell(row, col).value = orig_val
+            strip_tables(wb)
+            out = io.BytesIO()
+            wb.save(out)
+            drive_upload(svc, info["file_id"], out.getvalue(), info["file_name"])
+            saved.append(info["file_name"])
+        except Exception as e:
+            errors.append(f"{wb_type}: {e}")
+    if saved:
+        del st.session_state["undo_snapshot"]
     return saved, errors
 
 
@@ -1983,4 +2074,19 @@ else:
                 st.error(err)
         except Exception as e:
             st.error(f"Drive error: {e}")
+
+# ── Undo button (shown whenever a snapshot exists) ────────────────────────────
+if "undo_snapshot" in st.session_state:
+    st.divider()
+    st.warning("Last upload can be undone — this will restore all cells to their original values.")
+    if st.button("↩ Undo Everything", key="undo_all", type="secondary"):
+        try:
+            with st.spinner("Restoring original values..."):
+                saved, errors = undo_all_changes(get_drive_service())
+            for name in saved:
+                st.success(f"Restored **{name}** to original state.")
+            for err in errors:
+                st.error(err)
+        except Exception as e:
+            st.error(f"Undo error: {e}")
 
