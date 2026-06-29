@@ -1079,7 +1079,15 @@ SCOPES     = ["https://www.googleapis.com/auth/drive"]
 
 @st.cache_resource
 def get_drive_service():
-    creds = service_account.Credentials.from_service_account_file(CREDS_PATH, scopes=SCOPES)
+    # Production (Streamlit Cloud): credentials stored in st.secrets["google_credentials"]
+    if "google_credentials" in st.secrets:
+        import json
+        creds = service_account.Credentials.from_service_account_info(
+            dict(st.secrets["google_credentials"]), scopes=SCOPES
+        )
+    else:
+        # Local dev: read from file
+        creds = service_account.Credentials.from_service_account_file(CREDS_PATH, scopes=SCOPES)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
