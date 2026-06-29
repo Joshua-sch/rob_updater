@@ -1498,8 +1498,9 @@ with toggle_col:
     st.write("")
     test_mode = st.toggle("Test Mode", value=False, key="test_mode")
 
-# ── Manual upload (collapsed) ─────────────────────────────────────────────────
-with st.expander("Manual Upload", expanded=False):
+# ── Manual upload (test mode only) ───────────────────────────────────────────
+if test_mode:
+ with st.expander("Manual Upload", expanded=False):
     with st.expander("ROB Update"):
         st.header("ROB Master Workbook Update")
         csv_file = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="rob_csv")
@@ -1775,38 +1776,48 @@ with st.expander("Manual Upload", expanded=False):
     
 st.divider()
 # ── Google Drive Update ───────────────────────────────────────────────────────
-st.header("Google Drive Update")
-st.caption(f"Current month: **{datetime.date.today().strftime('%B %Y')}**")
+col_title, col_month = st.columns([5, 2])
+with col_title:
+    st.header("Weekly Workbook Update")
+with col_month:
+    st.write("")
+    st.write("")
+    st.caption(f"📅 Current month: **{datetime.date.today().strftime('%B %Y')}**")
 
 hotels = get_hotels_from_drive()
 hotel_names = [h[0] for h in hotels]
 hotel_id_map = {h[0]: h[1] for h in hotels}
 
-col_h, col_ref, col_w = st.columns([3, 1, 3])
-with col_h:
-    hotel_sel = st.selectbox("Hotel", hotel_names if hotel_names else ["(no hotels found)"], key="drive_hotel")
-with col_ref:
-    st.write("")
-    if st.button("↺ Refresh", key="refresh_hotels"):
-        get_hotels_from_drive.clear()
-        st.rerun()
-with col_w:
-    wb_sels = st.multiselect(
-        "Workbooks to update",
-        WORKBOOK_TYPES,
-        default=WORKBOOK_TYPES,
-        key="drive_wb",
-    )
+start_new_month = False
+with st.container(border=True):
+    col_h, col_ref, col_w = st.columns([3, 1, 3])
+    with col_h:
+        hotel_sel = st.selectbox("Hotel", hotel_names if hotel_names else ["(no hotels found)"], key="drive_hotel")
+    with col_ref:
+        st.write("")
+        if st.button("↺", key="refresh_hotels", help="Refresh hotel list"):
+            get_hotels_from_drive.clear()
+            st.rerun()
+    with col_w:
+        wb_sels = st.multiselect(
+            "Workbooks to update",
+            WORKBOOK_TYPES,
+            default=WORKBOOK_TYPES,
+            key="drive_wb",
+        )
 
-drive_csv = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="drive_csv")
-drive_rate_csv = None
-if "Strategy Report" in (wb_sels or []):
-    drive_rate_csv = st.file_uploader("Upload Rates & Restrictions CSV", type=["csv"], key="drive_rate_csv")
-forecast_next_month = False
-if "Forecast" in (wb_sels or []):
-    forecast_next_month = st.checkbox("Forecast next month as well?", key="drive_fcst_next")
+    drive_csv = st.file_uploader("CSV — Business on the Books", type=["csv"], key="drive_csv")
+    drive_rate_csv = None
+    if "Strategy Report" in (wb_sels or []):
+        drive_rate_csv = st.file_uploader("CSV — Rates & Restrictions", type=["csv"], key="drive_rate_csv")
 
-start_new_month = st.checkbox("Start new month", key="drive_new_month")
+    opt_col1, opt_col2 = st.columns(2)
+    forecast_next_month = False
+    if "Forecast" in (wb_sels or []):
+        with opt_col1:
+            forecast_next_month = st.checkbox("Include next month's Forecast", key="drive_fcst_next")
+    with opt_col2:
+        start_new_month = st.checkbox("Set up new month", key="drive_new_month")
 if start_new_month:
     with st.container(border=True):
         st.markdown("**New Month Setup — Strategy Report**")
@@ -1904,17 +1915,18 @@ if start_new_month:
         # Reset button — shown after a successful setup
         if "setup_undo" in st.session_state:
             st.divider()
-            st.warning("Last setup can be reset — this will restore the workbook to its original state.")
-            if st.button("↩ Reset Workbook to Original", key="setup_reset", type="secondary"):
-                try:
-                    info = st.session_state["setup_undo"]
-                    with st.spinner("Restoring original workbook..."):
-                        get_drive_service()  # ensure auth
-                        drive_upload(get_drive_service(), info["file_id"], info["bytes"], info["file_name"])
-                    del st.session_state["setup_undo"]
-                    st.success(f"**{info['file_name']}** restored to original state.")
-                except Exception as e:
-                    st.error(f"Reset error: {e}")
+            reset_col, _ = st.columns([2, 5])
+            with reset_col:
+             if st.button("↩ Reset Workbook to Original", key="setup_reset", type="secondary", use_container_width=True):
+                 try:
+                     info = st.session_state["setup_undo"]
+                     with st.spinner("Restoring original workbook..."):
+                         get_drive_service()
+                         drive_upload(get_drive_service(), info["file_id"], info["bytes"], info["file_name"])
+                     del st.session_state["setup_undo"]
+                     st.success(f"**{info['file_name']}** restored to original state.")
+                 except Exception as e:
+                     st.error(f"Reset error: {e}")
 
 
 
@@ -2131,15 +2143,16 @@ else:
 # ── Undo button (shown whenever a snapshot exists) ────────────────────────────
 if "undo_snapshot" in st.session_state:
     st.divider()
-    st.warning("Last upload can be undone — this will restore all cells to their original values.")
-    if st.button("↩ Undo Everything", key="undo_all", type="secondary"):
-        try:
-            with st.spinner("Restoring original values..."):
-                saved, errors = undo_all_changes(get_drive_service())
-            for name in saved:
-                st.success(f"Restored **{name}** to original state.")
-            for err in errors:
-                st.error(err)
-        except Exception as e:
-            st.error(f"Undo error: {e}")
+    undo_col, _ = st.columns([2, 5])
+    with undo_col:
+        if st.button("↩ Undo Last Upload", key="undo_all", type="secondary", use_container_width=True):
+            try:
+                with st.spinner("Restoring original values..."):
+                    saved, errors = undo_all_changes(get_drive_service())
+                for name in saved:
+                    st.success(f"Restored **{name}** to original state.")
+                for err in errors:
+                    st.error(err)
+            except Exception as e:
+                st.error(f"Undo error: {e}")
 
