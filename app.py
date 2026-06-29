@@ -1088,7 +1088,10 @@ def drive_find_folder_by_keyword(service, keyword, parent_id=None):
     q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     if parent_id:
         q += " and '%s' in parents" % parent_id
-    result = service.files().list(q=q, fields="files(id, name)", pageSize=100).execute()
+    result = service.files().list(
+        q=q, fields="files(id, name)", pageSize=100,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
     for f in result.get("files", []):
         if keyword.lower() in f["name"].lower():
             return f["id"], f["name"]
@@ -1100,7 +1103,10 @@ def drive_find_file(service, keyword, parent_id):
     excluding files whose name also contains 'copy' (to skip backup copies)."""
     q = ("'%s' in parents and trashed = false "
          "and mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'") % parent_id
-    result = service.files().list(q=q, fields="files(id, name)").execute()
+    result = service.files().list(
+        q=q, fields="files(id, name)",
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
     for f in result.get("files", []):
         name_lower = f["name"].lower()
         if keyword.lower() in name_lower and "copy" not in name_lower:
@@ -1308,7 +1314,9 @@ def get_prev_month_otb_trans(service, hotel_id: str, hotel_name: str, current_mo
 
 def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_type: str, month_date: datetime.date = None):
     """
-    Walk Drive: Hotel > REVENUE REPORTS > Year > Month > file.
+    Walk Drive to find the target workbook. Handles two folder structures:
+      A) Hotel > MMMYYYY REVENUE REPORTS HOTEL > files  (month in folder name, files direct)
+      B) Hotel > REVENUE REPORTS > Year > Month > files (nested year/month subfolders)
     Returns ((file_id, file_name), None) or (None, error_message).
     Never touches files whose name contains 'master'.
     """
@@ -1319,29 +1327,65 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
     year_kw    = str(month_date.year)
     wb_keyword = WORKBOOK_KEYWORDS[workbook_type]
 
-    # Revenue Reports folder
-    rev_id, rev_name = drive_find_folder_by_keyword(service, "REVENUE REPORTS", parent_id=hotel_id)
-    if not rev_id:
-        return None, f"No 'REVENUE REPORTS' folder found under '{hotel_name}'."
+    def _list_subfolders(parent_id):
+        q = (f"'{parent_id}' in parents and trashed = false and "
+             f"mimeType = 'application/vnd.google-apps.folder'")
+        return service.files().list(
+            q=q, fields="files(id, name)", pageSize=100,
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
+        ).execute().get("files", [])
 
-    # Year folder
-    year_id, year_name = drive_find_folder_by_keyword(service, year_kw, parent_id=rev_id)
-    if not year_id:
-        return None, f"No '{year_kw}' folder found under '{rev_name}'."
+    def _find_file_in(folder_id, folder_name):
+        fid, fname = drive_find_file(service, wb_keyword, folder_id)
+        if not fid:
+            return None, f"No '{wb_keyword}' workbook found in '{folder_name}'."
+        if "master" in fname.lower():
+            return None, f"Resolved file '{fname}' looks like a master doc — aborting."
+        return (fid, fname), None
 
-    # Month folder
-    month_id, month_name = drive_find_folder_by_keyword(service, month_kw, parent_id=year_id)
-    if not month_id:
-        return None, f"No '{month_kw}' folder found under '{year_name}'."
+    hotel_children = _list_subfolders(hotel_id)
 
-    # File — never match master docs
-    file_id, file_name = drive_find_file(service, wb_keyword, month_id)
-    if not file_id:
-        return None, f"No '{wb_keyword}' workbook found in '{month_name}'."
-    if "master" in file_name.lower():
-        return None, f"Resolved file '{file_name}' looks like a master doc — aborting."
+    # A: Hotel > MMMYYYY REVENUE REPORTS HOTEL > file
+    a = next((f for f in hotel_children
+               if "REVENUE REPORTS" in f["name"].upper() and month_kw in f["name"].upper()), None)
+    if a:
+        return _find_file_in(a["id"], a["name"])
 
-    return (file_id, file_name), None
+    # B: Hotel > REVENUE REPORTS > MMMYYYY ... > file  (month folder inside rev-reports)
+    # Prefer the revenue reports folder that also matches the target year
+    rev = next((f for f in hotel_children
+                if "REVENUE REPORTS" in f["name"].upper() and year_kw in f["name"]), None)
+    if not rev:
+        rev = next((f for f in hotel_children if "REVENUE REPORTS" in f["name"].upper()), None)
+    if rev:
+        rev_children = _list_subfolders(rev["id"])
+        # B1: month folder directly inside REVENUE REPORTS
+        b1 = next((f for f in rev_children if month_kw in f["name"].upper()), None)
+        if b1:
+            return _find_file_in(b1["id"], b1["name"])
+        # B2: year subfolder → month subfolder
+        b2_year = next((f for f in rev_children
+                        if year_kw in f["name"].upper()
+                        and "REVENUE REPORTS" not in f["name"].upper()), None)
+        if b2_year:
+            b2_month_id, b2_month_name = drive_find_folder_by_keyword(
+                service, month_kw, parent_id=b2_year["id"])
+            if b2_month_id:
+                return _find_file_in(b2_month_id, b2_month_name)
+
+    # C: Hotel > Year > Month > file  (no REVENUE REPORTS wrapper)
+    c_year = next((f for f in hotel_children
+                   if year_kw in f["name"].upper()
+                   and "REVENUE REPORTS" not in f["name"].upper()), None)
+    if c_year:
+        c_month_id, c_month_name = drive_find_folder_by_keyword(
+            service, month_kw, parent_id=c_year["id"])
+        if c_month_id:
+            return _find_file_in(c_month_id, c_month_name)
+
+    return None, (f"Could not find '{month_kw}' workbook for '{hotel_name}'. "
+                  f"Checked: top-level month folder, REVENUE REPORTS subfolders, "
+                  f"and Year > Month subfolders.")
 
 
 DOW_ABBREVS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
@@ -1776,6 +1820,7 @@ if start_new_month:
                                                           "Strategy Report", month_date=next_month_dt)
                     if existing:
                         st.info(f"Found existing file: **{existing[1]}** — skipping copy.")
+                    else:
                         created_name, create_err = setup_new_sr_month(svc, hotel_id_nm, hotel_sel, next_month_dt)
                         if create_err:
                             master_id, master_name = find_sr_master(svc, hotel_id_nm)
