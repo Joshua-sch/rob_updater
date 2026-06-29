@@ -1110,7 +1110,8 @@ def drive_find_file(service, keyword, parent_id):
     """Return (file_id, file_name) for first xlsx whose name contains keyword,
     excluding files whose name also contains 'copy' (to skip backup copies)."""
     q = ("'%s' in parents and trashed = false "
-         "and mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'") % parent_id
+         "and (mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+         "or mimeType = 'application/vnd.ms-excel.sheet.macroenabled.12')") % parent_id
     result = service.files().list(
         q=q, fields="files(id, name)",
         supportsAllDrives=True, includeItemsFromAllDrives=True,
@@ -1373,8 +1374,7 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
             return _find_file_in(b1["id"], b1["name"])
         # B2: year subfolder → month subfolder
         b2_year = next((f for f in rev_children
-                        if year_kw in f["name"].upper()
-                        and "REVENUE REPORTS" not in f["name"].upper()), None)
+                        if year_kw in f["name"].upper()), None)
         if b2_year:
             b2_month_id, b2_month_name = drive_find_folder_by_keyword(
                 service, month_kw, parent_id=b2_year["id"])
