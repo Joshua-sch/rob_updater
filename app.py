@@ -1304,6 +1304,168 @@ def drive_copy_file(service, source_file_id: str, new_name: str, parent_folder_i
     return copied["id"], copied["name"]
 
 
+def find_rob_master(service, hotel_id: str):
+    """Search the hotel's Drive tree for the ROB master file."""
+    q = ("trashed=false "
+         "and (mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+         "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12') "
+         "and name contains 'MASTER' and name contains 'ROB'")
+    result = service.files().list(
+        q=q, fields="files(id,name,parents)", pageSize=50,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
+    for f in result.get("files", []):
+        return f["id"], f["name"]
+    return None, "No ROB master file found in Drive."
+
+
+def _is_rob_month_blank(ws, block_start):
+    """Return True if cols 2,3,4 of the Revenue row are all empty."""
+    rev_row = block_start + 1
+    return all(
+        ws.cell(rev_row, c).value is None or ws.cell(rev_row, c).value == ""
+        for c in [2, 3, 4]
+    )
+
+
+def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_sheet_name):
+    """Fill one ROB sheet tab with historical data."""
+    from openpyxl.utils import get_column_letter
+
+    target_idx  = target_month.month - 1   # 0-based (Jul = 6)
+    prev_idx    = target_idx - 1           # most recently completed month (Jun = 5)
+    # LY col → new col shift: LY has [2022,2023,2024,2025], new needs [2023,2024,2025,2026]
+    ly_to_new   = {3: 2, 4: 3, 5: 4}
+    # Row offsets within a block that carry real data
+    data_offsets = [0, 1, 2, 3, 4, 5, 6, 7]  # 0=date header, 1-7=data rows
+
+    for month_idx in range(12):
+        block_start = 4 + 8 * month_idx
+
+        if month_idx < target_idx:
+            # ── Past month ────────────────────────────────────────────────────
+            if not _is_rob_month_blank(new_ws, block_start):
+                continue  # already has data — never overwrite
+
+            if is_wk_one:
+                # Copy from prev month ROB
+                if prev_ws is None:
+                    continue
+                # Include col 5 (current year) only for months older than prev month
+                cols = [2, 3, 4] + ([5] if month_idx < prev_idx else [])
+                for dr in data_offsets:
+                    r = block_start + dr
+                    for c in cols:
+                        v = prev_ws.cell(r, c).value
+                        if v is not None and not is_formula(str(v)):
+                            new_ws.cell(r, c).value = v
+            else:
+                # Formula referencing exact wk one cell
+                for dr in data_offsets:
+                    r = block_start + dr
+                    for c in [2, 3, 4, 5]:
+                        col_ltr = get_column_letter(c)
+                        new_ws.cell(r, c).value = f"='{wk_one_sheet_name}'!{col_ltr}{r}"
+
+        else:
+            # ── Current month or future month ─────────────────────────────────
+            if ly_ws is None:
+                continue
+            # Date header + data rows: shift LY cols 3,4,5 → new cols 2,3,4
+            for dr in data_offsets:
+                r = block_start + dr
+                for ly_col, new_col in ly_to_new.items():
+                    v = ly_ws.cell(r, ly_col).value
+                    if v is not None and not is_formula(str(v)):
+                        new_ws.cell(r, new_col).value = v
+            # Col H (not p/u STLY, col 8) — Group rows only (offsets 4,5,6)
+            for dr in [4, 5, 6]:
+                r = block_start + dr
+                v = ly_ws.cell(r, 8).value
+                if v is not None and not is_formula(str(v)):
+                    new_ws.cell(r, 8).value = v
+
+
+def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date):
+    """Full ROB new-month setup. Returns (new_file_name, error_str)."""
+    year_kw  = str(target_month.year)
+    month_kw = target_month.strftime("%b%Y").upper()
+
+    # ── Locate or create month folder ────────────────────────────────────────
+    rev_id, _ = drive_find_folder_by_keyword(service, "REVENUE REPORTS", parent_id=hotel_id)
+    if not rev_id:
+        return None, "No REVENUE REPORTS folder."
+    year_id, _ = drive_find_folder_by_keyword(service, year_kw, parent_id=rev_id)
+    if not year_id:
+        return None, f"No {year_kw} folder."
+    month_id, _ = drive_find_or_create_month_folder(service, rev_id, year_id, target_month, hotel_name)
+
+    # ── Find or copy the file ─────────────────────────────────────────────────
+    existing_id, existing_name = drive_find_file(service, "ROB", month_id)
+    if existing_id and "master" not in existing_name.lower():
+        new_file_id, new_file_name = existing_id, existing_name
+    else:
+        master_id, master_name = find_rob_master(service, hotel_id)
+        if not master_id:
+            return None, master_name
+        hotel_suffix = hotel_name.upper()
+        name_upper   = master_name.upper()
+        if "ROB" in name_upper:
+            after = master_name[name_upper.find("ROB") + 3:].strip()
+            after = after.replace(".xlsx","").replace(".xlsm","").replace(".XLSX","").replace(".XLSM","").strip()
+            if after:
+                hotel_suffix = after
+        ext = ".xlsm" if master_name.lower().endswith(".xlsm") else ".xlsx"
+        new_file_name = f"{month_kw} ROB {hotel_suffix}{ext}"
+        try:
+            new_file_id, new_file_name = drive_copy_file(service, master_id, new_file_name, month_id)
+        except Exception as e:
+            return None, str(e)
+
+    # ── Load all three workbooks ──────────────────────────────────────────────
+    new_wb_bytes = drive_download(service, new_file_id)
+    new_wb = openpyxl.load_workbook(io.BytesIO(new_wb_bytes), data_only=False)
+
+    prev_month_dt = (target_month - datetime.timedelta(days=1)).replace(day=1)
+    prev_result, _ = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB",
+                                             month_date=prev_month_dt)
+    prev_wb = None
+    if prev_result:
+        try:
+            prev_wb = openpyxl.load_workbook(
+                io.BytesIO(drive_download(service, prev_result[0])), data_only=True)
+        except Exception:
+            pass
+
+    ly_month_dt = target_month.replace(year=target_month.year - 1)
+    ly_result, _ = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB",
+                                           month_date=ly_month_dt)
+    ly_wb = None
+    if ly_result:
+        try:
+            ly_wb = openpyxl.load_workbook(
+                io.BytesIO(drive_download(service, ly_result[0])), data_only=True)
+        except Exception:
+            pass
+
+    # ── Fill each sheet ───────────────────────────────────────────────────────
+    wk_one_name = ROB_SHEETS[0]
+    for sheet_name in ROB_SHEETS:
+        if sheet_name not in new_wb.sheetnames:
+            continue
+        new_ws = new_wb[sheet_name]
+        prev_ws = prev_wb[sheet_name] if prev_wb and sheet_name in prev_wb.sheetnames else None
+        ly_ws   = ly_wb[sheet_name]   if ly_wb   and sheet_name in ly_wb.sheetnames   else None
+        is_wk_one = (sheet_name == wk_one_name)
+        _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_name)
+
+    strip_tables(new_wb)
+    out = io.BytesIO()
+    new_wb.save(out)
+    drive_upload(service, new_file_id, out.getvalue(), new_file_name)
+    return new_file_name, None
+
+
 def find_forecast_master(service, hotel_id: str):
     """Search the hotel's Drive tree for the Forecast master file (.xlsx or .xlsm)."""
     q = ("trashed=false "
@@ -2012,97 +2174,116 @@ with st.container(border=True):
         start_new_month = st.checkbox("Set up new month", key="drive_new_month")
 if start_new_month:
     with st.container(border=True):
-        st.markdown("**New Month Setup — Strategy Report**")
         next_month_dt = (datetime.date.today().replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
         month_kw      = next_month_dt.strftime("%b%Y").upper()
-        st.caption(
-            f"Target: **{next_month_dt.strftime('%B %Y')}** · "
-            f"Creates the workbook (if needed) and fills all 5 weeks of LY + historical data in one shot."
-        )
+        st.caption(f"Setting up workbooks for **{next_month_dt.strftime('%B %Y')}**")
 
-        if st.button("Set Up New Workbook", key="btn_setup_new_wb", type="primary"):
-            try:
-                svc         = get_drive_service()
-                hotel_id_nm = hotel_id_map.get(hotel_sel, "")
+        rob_col, sr_col = st.columns(2)
 
-                # Step 1 — ensure the file exists; skip copy if it's already there
-                with st.spinner("Step 1 / 3 — locating or creating workbook..."):
-                    existing, find_err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
-                                                          "Strategy Report", month_date=next_month_dt)
-                    if existing:
-                        st.info(f"Found existing file: **{existing[1]}** — skipping copy.")
+        # ── ROB setup ──────────────────────────────────────────────────────────
+        with rob_col:
+            st.markdown("**ROB**")
+            if st.button("Set Up New ROB", key="btn_setup_rob", type="primary", use_container_width=True):
+                try:
+                    svc         = get_drive_service()
+                    hotel_id_nm = hotel_id_map.get(hotel_sel, "")
+                    with st.spinner("Setting up ROB — this may take a moment..."):
+                        rob_name, rob_err = setup_new_rob_month(svc, hotel_id_nm, hotel_sel, next_month_dt)
+                    if rob_err and not rob_name:
+                        st.error(f"ROB setup error: {rob_err}")
                     else:
-                        created_name, create_err = setup_new_sr_month(svc, hotel_id_nm, hotel_sel, next_month_dt)
-                        if create_err:
-                            master_id, master_name = find_sr_master(svc, hotel_id_nm)
-                            hotel_suffix = ""
-                            if master_name and "STRATEGY" in master_name.upper():
-                                hotel_suffix = master_name[master_name.upper().find("STRATEGY") + len("STRATEGY"):].strip().replace(".xlsx","").replace(".XLSX","").strip()
-                            suggested_name = f"{month_kw} STRATEGY {hotel_suffix}.xlsx".strip()
-                            if "storageQuotaExceeded" in str(create_err):
-                                st.warning(
-                                    f"Auto-copy requires a Shared Drive. Do this in Google Drive first:\n\n"
-                                    f"1. Right-click **{master_name or 'the SR master'}** → *Make a copy*\n"
-                                    f"2. Rename to: **`{suggested_name}`**\n"
-                                    f"3. Move into the **{month_kw}** folder\n\n"
-                                    f"Then click **Set Up New Workbook** again."
-                                )
-                            else:
-                                st.error(f"Could not create workbook: {create_err}")
+                        if rob_err:
+                            st.warning(rob_err)
+                        st.success(f"**{rob_name}** ready for {next_month_dt.strftime('%B %Y')}.")
+                except Exception as e:
+                    st.error(f"ROB setup error: {e}")
+
+        # ── Strategy Report setup ──────────────────────────────────────────────
+        with sr_col:
+            st.markdown("**Strategy Report**")
+            if st.button("Set Up New SR", key="btn_setup_new_wb", type="primary", use_container_width=True):
+                try:
+                    svc         = get_drive_service()
+                    hotel_id_nm = hotel_id_map.get(hotel_sel, "")
+
+                    # Step 1 — ensure the file exists; skip copy if it's already there
+                    with st.spinner("Step 1 / 3 — locating or creating workbook..."):
+                        existing, find_err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
+                                                              "Strategy Report", month_date=next_month_dt)
+                        if existing:
+                            st.info(f"Found existing file: **{existing[1]}** — skipping copy.")
+                        else:
+                            created_name, create_err = setup_new_sr_month(svc, hotel_id_nm, hotel_sel, next_month_dt)
+                            if create_err:
+                                master_id, master_name = find_sr_master(svc, hotel_id_nm)
+                                hotel_suffix = ""
+                                if master_name and "STRATEGY" in master_name.upper():
+                                    hotel_suffix = master_name[master_name.upper().find("STRATEGY") + len("STRATEGY"):].strip().replace(".xlsx","").replace(".XLSX","").strip()
+                                suggested_name = f"{month_kw} STRATEGY {hotel_suffix}.xlsx".strip()
+                                if "storageQuotaExceeded" in str(create_err):
+                                    st.warning(
+                                        f"Auto-copy requires a Shared Drive. Do this in Google Drive first:\n\n"
+                                        f"1. Right-click **{master_name or 'the SR master'}** → *Make a copy*\n"
+                                        f"2. Rename to: **`{suggested_name}`**\n"
+                                        f"3. Move into the **{month_kw}** folder\n\n"
+                                        f"Then click **Set Up New SR** again."
+                                    )
+                                else:
+                                    st.error(f"Could not create workbook: {create_err}")
+                                st.stop()
+
+                    # Step 2 — load reference workbooks into memory
+                    with st.spinner("Step 2 / 3 — loading reference workbooks..."):
+                        prev_month_dt    = (next_month_dt - datetime.timedelta(days=1)).replace(day=1)
+                        ly_month_dt      = next_month_dt.replace(year=next_month_dt.year - 1)
+                        prev_month_sr_wb = _load_wb_from_drive(svc, hotel_id_nm, hotel_sel, "Strategy Report", prev_month_dt, data_only=False)
+                        ly_sr_wb         = _load_wb_from_drive(svc, hotel_id_nm, hotel_sel, "Strategy Report", ly_month_dt)
+                    st.info(f"Prev month ({prev_month_dt.strftime('%b %Y')}): {'✓' if prev_month_sr_wb else '✗ not found'}")
+                    st.info(f"Last year  ({ly_month_dt.strftime('%b %Y')}): {'✓' if ly_sr_wb else '✗ not found'}")
+
+                    # Step 3 — populate all 5 weeks
+                    with st.spinner("Step 3 / 3 — populating all weeks..."):
+                        result, err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
+                                                             "Strategy Report", month_date=next_month_dt)
+                        if err:
+                            st.error(f"Cannot open new workbook: {err}")
                             st.stop()
+                        file_id, file_name = result
+                        wb_bytes = drive_download(svc, file_id)
+                        original_bytes = wb_bytes
+                        wb       = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
+                        restructure_sr_dates(wb, next_month_dt)
+                        first_ws = wb[STRATEGY_SHEETS[0]] if STRATEGY_SHEETS[0] in wb.sheetnames else None
+                        num_rows = _count_sheet_data_rows(first_ws) if first_ws else 365
+                        full_scope_start = next_month_dt
+                        full_scope_end   = next_month_dt + datetime.timedelta(days=max(0, num_rows - 1))
+                        total_written = 0
+                        for sheet_name in STRATEGY_SHEETS:
+                            if sheet_name not in wb.sheetnames:
+                                continue
+                            changes = build_strategy_change_plan(None, wb, sheet_name,
+                                                                  prev_month_wb=prev_month_sr_wb,
+                                                                  ly_wb=ly_sr_wb,
+                                                                  scope_start=full_scope_start,
+                                                                  scope_end=full_scope_end)
+                            apply_strategy_changes(wb, sheet_name, changes)
+                            total_written += len([c for c in changes if not c.get("skip_reason")])
+                        strip_tables(wb)
+                        out = io.BytesIO()
+                        wb.save(out)
+                        drive_upload(svc, file_id, out.getvalue(), file_name)
+                        st.session_state["setup_undo"] = {
+                            "file_id":   file_id,
+                            "file_name": file_name,
+                            "bytes":     original_bytes,
+                        }
 
-                # Step 2 — load reference workbooks into memory
-                with st.spinner("Step 2 / 3 — loading reference workbooks..."):
-                    prev_month_dt    = (next_month_dt - datetime.timedelta(days=1)).replace(day=1)
-                    ly_month_dt      = next_month_dt.replace(year=next_month_dt.year - 1)
-                    prev_month_sr_wb = _load_wb_from_drive(svc, hotel_id_nm, hotel_sel, "Strategy Report", prev_month_dt, data_only=False)
-                    ly_sr_wb         = _load_wb_from_drive(svc, hotel_id_nm, hotel_sel, "Strategy Report", ly_month_dt)
-                st.info(f"Prev month ({prev_month_dt.strftime('%b %Y')}): {'✓' if prev_month_sr_wb else '✗ not found'}")
-                st.info(f"Last year  ({ly_month_dt.strftime('%b %Y')}): {'✓' if ly_sr_wb else '✗ not found'}")
-
-                # Step 3 — populate all 5 weeks
-                with st.spinner("Step 3 / 3 — populating all weeks..."):
-                    result, err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
-                                                         "Strategy Report", month_date=next_month_dt)
-                    if err:
-                        st.error(f"Cannot open new workbook: {err}")
-                        st.stop()
-                    file_id, file_name = result
-                    wb_bytes = drive_download(svc, file_id)
-                    original_bytes = wb_bytes  # snapshot before any changes
-                    wb       = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
-                    restructure_sr_dates(wb, next_month_dt)
-                    first_ws = wb[STRATEGY_SHEETS[0]] if STRATEGY_SHEETS[0] in wb.sheetnames else None
-                    num_rows = _count_sheet_data_rows(first_ws) if first_ws else 365
-                    full_scope_start = next_month_dt
-                    full_scope_end   = next_month_dt + datetime.timedelta(days=max(0, num_rows - 1))
-                    total_written = 0
-                    for sheet_name in STRATEGY_SHEETS:
-                        if sheet_name not in wb.sheetnames:
-                            continue
-                        changes = build_strategy_change_plan(None, wb, sheet_name,
-                                                              prev_month_wb=prev_month_sr_wb,
-                                                              ly_wb=ly_sr_wb,
-                                                              scope_start=full_scope_start,
-                                                              scope_end=full_scope_end)
-                        apply_strategy_changes(wb, sheet_name, changes)
-                        total_written += len([c for c in changes if not c.get("skip_reason")])
-                    strip_tables(wb)
-                    out = io.BytesIO()
-                    wb.save(out)
-                    drive_upload(svc, file_id, out.getvalue(), file_name)
-                    st.session_state["setup_undo"] = {
-                        "file_id":   file_id,
-                        "file_name": file_name,
-                        "bytes":     original_bytes,
-                    }
-
-                st.success(
-                    f"**{file_name}** is set up for {next_month_dt.strftime('%B %Y')}. "
-                    f"Populated **{total_written}** cells across all weeks."
-                )
-            except Exception as e:
-                st.error(f"Setup error: {e}")
+                    st.success(
+                        f"**{file_name}** is set up for {next_month_dt.strftime('%B %Y')}. "
+                        f"Populated **{total_written}** cells across all weeks."
+                    )
+                except Exception as e:
+                    st.error(f"Setup error: {e}")
 
         # Reset button — shown after a successful setup
         if "setup_undo" in st.session_state:
