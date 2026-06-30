@@ -870,7 +870,89 @@ def find_next_pickup_data_row(ws):
     return None
 
 
-def build_forecast_change_plan(df, ws):
+def extract_rob_month_end_data(rob_wb, target_month):
+    """Pull Budget and Last Year Room Nights + Revenue for target_month from any ROB sheet."""
+    for sheet_name in rob_wb.sheetnames:
+        ws = rob_wb[sheet_name]
+        # Scan for the month block header row (col A = month abbreviation, e.g. "Jul")
+        month_abbr = target_month.strftime("%b").lower()
+        for r in range(1, ws.max_row + 1):
+            cell_val = str(ws.cell(r, 1).value or "").strip().lower()
+            if cell_val != month_abbr:
+                continue
+            # Found the block header row — find Budget and Last Year columns
+            budget_col = ly_col = None
+            for c in range(1, 25):
+                hdr = str(ws.cell(r, c).value or "").strip()
+                if not budget_col and "budget" in hdr.lower():
+                    budget_col = c
+                elif not ly_col and ("month end" in hdr.lower() or ("last" in hdr.lower() and "year" in hdr.lower())):
+                    ly_col = c
+                if budget_col and ly_col:
+                    break
+            # Also check row 4 (global header) if not found on block row
+            if not budget_col or not ly_col:
+                for c in range(1, 25):
+                    hdr = str(ws.cell(4, c).value or "").strip()
+                    if not budget_col and "budget" in hdr.lower():
+                        budget_col = c
+                    elif not ly_col and "month end" in hdr.lower():
+                        ly_col = c
+                    if budget_col and ly_col:
+                        break
+            if not budget_col or not ly_col:
+                continue
+            # Scan the next ~8 rows for Revenue and Room Nights labels in col A
+            rev_row = rms_row = None
+            for dr in range(1, 9):
+                label = str(ws.cell(r + dr, 1).value or "").strip().lower()
+                if "revenue" in label and rev_row is None:
+                    rev_row = r + dr
+                elif ("room" in label or "night" in label) and rms_row is None:
+                    rms_row = r + dr
+                if rev_row and rms_row:
+                    break
+            if not rev_row or not rms_row:
+                continue
+            return {
+                "budget_rev": safe_float(ws.cell(rev_row, budget_col).value),
+                "budget_rms": safe_float(ws.cell(rms_row, budget_col).value),
+                "ly_rev":     safe_float(ws.cell(rev_row, ly_col).value),
+                "ly_rms":     safe_float(ws.cell(rms_row, ly_col).value),
+            }
+    return None
+
+
+def find_month_ending_forecast_cells(fcst_ws):
+    """Return cell coords for Budget/LY Room Nts and Revenue in the Month Ending Forecast table."""
+    for r in range(1, fcst_ws.max_row + 1):
+        for c in range(1, fcst_ws.max_column + 1):
+            if "month ending forecast" in str(fcst_ws.cell(r, c).value or "").lower():
+                # Header found — scan next ~6 rows for Budget and Last Year rows
+                # and the header row for column positions
+                hdr_row = col_rms = col_rev = None
+                budget_row = ly_row = None
+                for dr in range(1, 8):
+                    row_vals = {col: str(fcst_ws.cell(r + dr, col).value or "").strip()
+                                for col in range(1, 8)}
+                    row_text = " ".join(row_vals.values()).lower()
+                    if "room" in row_text and hdr_row is None:
+                        hdr_row = r + dr
+                        for col, v in row_vals.items():
+                            if "room" in v.lower():
+                                col_rms = col
+                            elif "revenue" in v.lower() or "rev" in v.lower():
+                                col_rev = col
+                    if "budget" in row_text and budget_row is None:
+                        budget_row = r + dr
+                    if "last year" in row_text and ly_row is None:
+                        ly_row = r + dr
+                if col_rms and col_rev and budget_row and ly_row:
+                    return col_rms, col_rev, budget_row, ly_row
+    return None, None, None, None
+
+
+def build_forecast_change_plan(df, ws, rob_wb=None, is_wk1=False):
     """Build list of cell writes for the Forecast sheet."""
     today = datetime.date.today()
     yesterday = today - datetime.timedelta(days=1)
@@ -948,6 +1030,28 @@ def build_forecast_change_plan(df, ws):
                             "new_value": rms, "skip_reason": skip})
     else:
         warnings.append("No available row found in pick-up tracking chart.")
+
+    # Month Ending Forecast table — only on WK1, only when ROB workbook provided
+    if is_wk1 and rob_wb is not None:
+        target_month = today.replace(day=1)
+        rob_data = extract_rob_month_end_data(rob_wb, target_month)
+        if rob_data:
+            col_rms, col_rev, budget_row, ly_row = find_month_ending_forecast_cells(ws)
+            if col_rms and col_rev and budget_row and ly_row:
+                entries = [
+                    (budget_row, col_rms, "Month End Forecast: Budget Room Nts", rob_data["budget_rms"]),
+                    (budget_row, col_rev, "Month End Forecast: Budget Revenue",  rob_data["budget_rev"]),
+                    (ly_row,     col_rms, "Month End Forecast: LY Room Nts",     rob_data["ly_rms"]),
+                    (ly_row,     col_rev, "Month End Forecast: LY Revenue",       rob_data["ly_rev"]),
+                ]
+                for r, c, label, val in entries:
+                    skip = "formula" if is_formula(ws.cell(r, c).value) else None
+                    changes.append({"label": label, "row": r, "col": c,
+                                    "new_value": val, "skip_reason": skip})
+            else:
+                warnings.append("Could not locate Month Ending Forecast table in forecast sheet.")
+        else:
+            warnings.append("Could not find month data in ROB workbook for Month Ending Forecast.")
 
     return changes, warnings
 
@@ -1971,7 +2075,7 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
                 rate_changes, rate_warnings = build_rates_change_plan(rate_df, wb, sheet)
                 changes  += rate_changes
                 warnings += rate_warnings
-        else:  # Forecast — current month
+        else:  # Forecast — current month (no Month Ending Forecast fill here)
             avail    = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
             auto     = first_uncolored_sheet(wb, avail)
             sheet    = auto or avail[0]
@@ -1999,6 +2103,19 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
             nm_auto  = first_uncolored_sheet(nm_wb, nm_avail)
             nm_sheet = nm_auto or nm_avail[0]
             nm_changes, nm_warnings = build_next_month_forecast_plan(df, nm_wb[nm_sheet])
+            # Month Ending Forecast table — fill Budget + LY from next month's ROB
+            nm_is_wk1 = (nm_sheet == FORECAST_SHEETS[0])
+            if nm_is_wk1:
+                nm_rob_result, _ = resolve_drive_workbook(svc, hotel_id, hotel_sel, "ROB",
+                                                           month_date=next_month_dt)
+                if nm_rob_result:
+                    nm_rob_wb = openpyxl.load_workbook(
+                        io.BytesIO(drive_download(svc, nm_rob_result[0])), data_only=True)
+                    extra, extra_warn = build_forecast_change_plan(
+                        df, nm_wb[nm_sheet], rob_wb=nm_rob_wb, is_wk1=True)
+                    # Only keep the Month Ending Forecast entries from extra
+                    nm_changes += [c for c in extra if "Month End Forecast" in c.get("label", "")]
+                    nm_warnings += extra_warn
             all_plans["Forecast (next month)"] = {
                 "file_id":   nm_file_id,
                 "file_name": nm_file_name,
