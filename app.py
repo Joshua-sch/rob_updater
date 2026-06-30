@@ -396,11 +396,11 @@ def get_ly_sr_data(service, hotel_id, hotel_name, current_month, sheet_name):
                 if v is not None and not is_formula(v):
                     row_data[ly_dest_field] = safe_float(v)
 
-        # Comp set TY value (far-left hotel col in LY sheet)
+        # Comp set TY value (far-left hotel col in LY sheet) — keep text as-is (e.g. "Sold out", "LOS2")
         if comp_ty_col:
             v = ly_ws.cell(r, comp_ty_col).value
             if v is not None and not is_formula(v):
-                row_data["comp_set_ly"] = safe_float(v)
+                row_data["comp_set_ly"] = v
 
         if row_data:
             out[this_year_date] = row_data
@@ -504,7 +504,7 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name):
         if comp_ty_col:
             val = ws.cell(r, comp_ty_col).value
             if val is not None and not is_formula(val):
-                row_data["comp_set_ly"] = safe_float(val)
+                row_data["comp_set_ly"] = val  # preserve text values like "Sold out", "LOS2"
         if row_data:
             out[this_year] = row_data
     return out
