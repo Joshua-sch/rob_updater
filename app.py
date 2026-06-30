@@ -1304,6 +1304,94 @@ def drive_copy_file(service, source_file_id: str, new_name: str, parent_folder_i
     return copied["id"], copied["name"]
 
 
+def find_forecast_master(service, hotel_id: str):
+    """Search the hotel's Drive tree for the Forecast master file (.xlsx or .xlsm)."""
+    q = ("trashed=false "
+         "and (mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+         "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12') "
+         "and name contains 'MASTER' and name contains 'FORECAST'")
+    result = service.files().list(
+        q=q, fields="files(id,name,parents)", pageSize=50,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
+    for f in result.get("files", []):
+        return f["id"], f["name"]
+    return None, "No FORECAST master file found in Drive."
+
+
+def setup_new_forecast_month(service, hotel_id: str, hotel_name: str, target_month: datetime.date):
+    """
+    Copy Forecast master → rename for target_month → place in month folder → set B4 date.
+    Returns (new_file_name, error_str).
+    """
+    year_kw  = str(target_month.year)
+    month_kw = target_month.strftime("%b%Y").upper()
+
+    rev_id, _ = drive_find_folder_by_keyword(service, "REVENUE REPORTS", parent_id=hotel_id)
+    if not rev_id:
+        return None, "No REVENUE REPORTS folder."
+    year_id, _ = drive_find_folder_by_keyword(service, year_kw, parent_id=rev_id)
+    if not year_id:
+        return None, f"No {year_kw} folder."
+
+    month_id, _ = drive_find_or_create_month_folder(service, rev_id, year_id, target_month, hotel_name)
+
+    # Check if Forecast already exists
+    existing_id, existing_name = drive_find_file(service, "FORECAST", month_id)
+    if existing_id and "master" not in existing_name.lower():
+        return existing_name, None
+
+    master_id, master_name = find_forecast_master(service, hotel_id)
+    if not master_id:
+        return None, master_name
+
+    # Infer hotel suffix from master name
+    hotel_suffix = hotel_name.upper()
+    name_upper = master_name.upper()
+    ext = ".xlsm" if master_name.lower().endswith(".xlsm") else ".xlsx"
+    for kw in ("FORECAST",):
+        if kw in name_upper:
+            after = master_name[name_upper.find(kw) + len(kw):].strip()
+            after = after.replace(".xlsx","").replace(".xlsm","").replace(".XLSX","").replace(".XLSM","").strip()
+            if after:
+                hotel_suffix = after
+            break
+
+    new_file_name = f"{month_kw} FORECAST {hotel_suffix}{ext}"
+    try:
+        new_file_id, created_name = drive_copy_file(service, master_id, new_file_name, month_id)
+    except Exception as e:
+        return None, str(e)
+
+    # Set B4 = first day of target_month in FCST-WK1
+    try:
+        wb_bytes  = drive_download(service, new_file_id)
+        wb        = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
+        sheet     = FORECAST_SHEETS[0] if FORECAST_SHEETS[0] in wb.sheetnames else wb.sheetnames[1] if len(wb.sheetnames) > 1 else wb.sheetnames[0]
+        ws        = wb[sheet]
+        # Find "Day of Week" cell → one right + one down = start date cell
+        date_cell_row = date_cell_col = None
+        for r in range(1, 15):
+            for c in range(1, 10):
+                if "day of week" in str(ws.cell(r, c).value or "").lower():
+                    date_cell_row = r + 1
+                    date_cell_col = c + 1
+                    break
+            if date_cell_row:
+                break
+        if date_cell_row and date_cell_col:
+            ws.cell(date_cell_row, date_cell_col).value = datetime.datetime(
+                target_month.year, target_month.month, 1)
+        strip_tables(wb)
+        out = io.BytesIO()
+        wb.save(out)
+        drive_upload(service, new_file_id, out.getvalue(), created_name)
+    except Exception as e:
+        return created_name, f"Copied OK but could not set start date: {e}"
+
+    return created_name, None
+
+
 def find_sr_master(service, hotel_id: str):
     """Search the hotel's REVENUE REPORTS tree for the SR master file.
     Returns (file_id, file_name) or (None, error_str).
@@ -2094,7 +2182,19 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
         next_month_dt = (datetime.date.today().replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
         nm_result, nm_err = resolve_drive_workbook(svc, hotel_id, hotel_sel, "Forecast", month_date=next_month_dt)
         if nm_err:
-            st.warning(f"Next month Forecast: {nm_err}")
+            # Workbook not found — auto-create from master
+            st.info(f"Next month Forecast not found — creating from master...")
+            created_name, setup_err = setup_new_forecast_month(svc, hotel_id, hotel_sel, next_month_dt)
+            if setup_err and not created_name:
+                st.warning(f"Next month Forecast: {setup_err}")
+            else:
+                if setup_err:
+                    st.warning(setup_err)
+                else:
+                    st.success(f"Created **{created_name}** for {next_month_dt.strftime('%B %Y')}.")
+                nm_result, nm_err = resolve_drive_workbook(svc, hotel_id, hotel_sel, "Forecast", month_date=next_month_dt)
+                if nm_err:
+                    st.warning(f"Still could not find next month Forecast after creation: {nm_err}")
         else:
             nm_file_id, nm_file_name = nm_result
             nm_bytes = drive_download(svc, nm_file_id)
