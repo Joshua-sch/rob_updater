@@ -1980,7 +1980,7 @@ def restructure_sr_dates(wb, target_month):
         if sheet_name not in wb.sheetnames:
             continue
         ws = wb[sheet_name]
-        num_rows = _count_sheet_data_rows(ws)
+        num_rows = min(_count_sheet_data_rows(ws), 365)
         if num_rows == 0:
             continue
         for i in range(num_rows):
