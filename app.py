@@ -1530,26 +1530,44 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
     target_idx  = target_month.month - 1   # 0-based (Jul = 6)
     prev_idx    = target_idx - 1           # most recently completed month (Jun = 5)
     # LY col → new col shift: LY has [2022,2023,2024,2025], new needs [2023,2024,2025,2026]
-    ly_to_new   = {3: 2, 4: 3, 5: 4}
-    # All row offsets within a block, including date header (0) and PICKUP WoW (7)
-    data_offsets = [0, 1, 2, 3, 4, 5, 6, 7]
+    ly_to_new    = {3: 2, 4: 3, 5: 4}
+    data_offsets = [1, 2, 3, 4, 5, 6, 7]  # offset 0 (date header) handled separately
+
+    # ── Build as-of dates once from LY ROB (same for every month block) ─────
+    # LY ROB cols 3,4,5 hold the prior 3 years' reporting dates → new cols 2,3,4
+    # Col 5 (current year) = the 1st of the target month
+    as_of_dates = {}
+    if ly_ws:
+        ref_row = 4 + 8 * target_idx   # any block works; use target month block
+        for ly_col, new_col in ly_to_new.items():
+            v = ly_ws.cell(ref_row, ly_col).value
+            if v is not None and not is_formula(str(v)):
+                as_of_dates[new_col] = v
+    as_of_dates[5] = datetime.datetime(target_month.year, target_month.month, target_month.day)
 
     for month_idx in range(12):
         block_start = 4 + 8 * month_idx
 
-        if month_idx < target_idx:
-            # ── Past months (Jan–Jun when target=Jul) ────────────────────────
+        # ── Date header row (offset 0): always write from computed as_of_dates ──
+        if is_wk_one:
+            for col, date_val in as_of_dates.items():
+                new_ws.cell(block_start, col).value = date_val
+        else:
+            for col in as_of_dates:
+                col_ltr = get_column_letter(col)
+                new_ws.cell(block_start, col).value = f"='{wk_one_sheet_name}'!{col_ltr}{block_start}"
+
+        # ── Data rows (offsets 1–7) ───────────────────────────────────────────
+        if month_idx < prev_idx:
+            # Past months (Jan–May when target=Jul): copy all 4 cols from prev ROB
             if not _is_rob_month_blank(new_ws, block_start):
                 continue
-
             if is_wk_one:
                 if prev_ws is None:
                     continue
-                # Include col 5 (current year) only for months older than prev month
-                cols = [2, 3, 4] + ([5] if month_idx < prev_idx else [])
                 for dr in data_offsets:
                     r = block_start + dr
-                    for c in cols:
+                    for c in [2, 3, 4, 5]:
                         v = prev_ws.cell(r, c).value
                         if v is not None and not is_formula(str(v)):
                             new_ws.cell(r, c).value = v
@@ -1560,9 +1578,34 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                         col_ltr = get_column_letter(c)
                         new_ws.cell(r, c).value = f"='{wk_one_sheet_name}'!{col_ltr}{r}"
 
+        elif month_idx == prev_idx:
+            # Prev month (Jun when target=Jul):
+            # Cols 2,3,4 = historical years from LY ROB (same source as Jul+)
+            # Col 5     = actual current-year data from prev ROB (built up weekly)
+            if not _is_rob_month_blank(new_ws, block_start):
+                continue
+            if is_wk_one:
+                if ly_ws:
+                    for dr in data_offsets:
+                        r = block_start + dr
+                        for ly_col, new_col in ly_to_new.items():
+                            v = ly_ws.cell(r, ly_col).value
+                            if v is not None and not is_formula(str(v)):
+                                new_ws.cell(r, new_col).value = v
+                    for dr in [4, 5, 6]:
+                        r = block_start + dr
+                        v = ly_ws.cell(r, 8).value
+                        if v is not None and not is_formula(str(v)):
+                            new_ws.cell(r, 8).value = v
+            else:
+                for dr in data_offsets:
+                    r = block_start + dr
+                    for c in [2, 3, 4, 5]:
+                        col_ltr = get_column_letter(c)
+                        new_ws.cell(r, c).value = f"='{wk_one_sheet_name}'!{col_ltr}{r}"
+
         else:
-            # ── Current month and future months ───────────────────────────────
-            # Cols 2,3,4 from LY ROB; col 5 (current year) left blank for BOB upload
+            # Current month and future months (Jul+): cols 2,3,4 from LY ROB
             if ly_ws is None:
                 continue
             for dr in data_offsets:
@@ -1571,7 +1614,6 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                     v = ly_ws.cell(r, ly_col).value
                     if v is not None and not is_formula(str(v)):
                         new_ws.cell(r, new_col).value = v
-            # Col H (not p/u STLY, col 8) — Group rows only (offsets 4,5,6)
             for dr in [4, 5, 6]:
                 r = block_start + dr
                 v = ly_ws.cell(r, 8).value
