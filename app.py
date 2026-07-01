@@ -91,7 +91,11 @@ def build_rob_change_plan(df, ws):
         if kind != "monthly":
             continue
         year, month = info
-        if year != current_year or month < current_month:
+        prev_month = current_month - 1 if current_month > 1 else 12
+        prev_year  = current_year if current_month > 1 else current_year - 1
+        if year == prev_year and month == prev_month:
+            pass  # allow previous month (final numbers come in on the 1st)
+        elif year != current_year or month < current_month:
             continue
 
         month_index = month - 1
@@ -709,7 +713,9 @@ def find_header_col(ws, keyword, header_rows=(2, 3, 4)):
 
 def build_rates_change_plan(rate_df, wb, sheet_name):
     today = datetime.date.today()
-    scope_start = today.replace(day=1)
+    # include previous month — final numbers arrive on the 1st of the following month
+    prev_month_start = (today.replace(day=1) - datetime.timedelta(days=1)).replace(day=1)
+    scope_start = prev_month_start
     scope_end = datetime.date(today.year, 12, 31)
 
     date_row_map = build_date_row_map(wb)
@@ -1220,9 +1226,12 @@ def drive_find_file(service, keyword, parent_id):
         q=q, fields="files(id, name)",
         supportsAllDrives=True, includeItemsFromAllDrives=True,
     ).execute()
-    for f in result.get("files", []):
+    files = result.get("files", [])
+    # prefer non-copy files; fall back to copy if nothing else found
+    files.sort(key=lambda f: (1 if "copy" in f["name"].lower() else 0))
+    for f in files:
         name_lower = f["name"].lower()
-        if keyword.lower() in name_lower and "copy" not in name_lower:
+        if keyword.lower() in name_lower and "master" not in name_lower:
             return f["id"], f["name"]
     return None, None
 
@@ -1328,6 +1337,190 @@ def _is_rob_month_blank(ws, block_start):
     )
 
 
+def _rob_as_of_date(year, month):
+    """Return the 1st of the month for a given year, advanced past Sat/Sun to Monday."""
+    d = datetime.date(year, month, 1)
+    if d.weekday() == 5:    # Saturday → Monday
+        d += datetime.timedelta(days=2)
+    elif d.weekday() == 6:  # Sunday → Monday
+        d += datetime.timedelta(days=1)
+    return d
+
+
+def _resolve_cell(prev_wb_data, prev_wb_formulas, sheet_name, row, col):
+    """Read a cell value, following simple cross-sheet formula references if needed.
+    When data_only=True returns None (no cached value), reads the formula string
+    from prev_wb_formulas and follows the reference (e.g. ='wk one'!B45)."""
+    import re
+    from openpyxl.utils import column_index_from_string
+
+    def _read_data(wb, sname, r, c):
+        if wb and sname in wb.sheetnames:
+            return wb[sname].cell(r, c).value
+        return None
+
+    v = _read_data(prev_wb_data, sheet_name, row, col)
+    if v is not None:
+        return v
+
+    # No cached value — try to follow the formula reference
+    if prev_wb_formulas and sheet_name in prev_wb_formulas.sheetnames:
+        formula = prev_wb_formulas[sheet_name].cell(row, col).value
+        if formula and str(formula).startswith("="):
+            m = re.match(r"^='?([^'!]+)'?!([A-Za-z]+)(\d+)$", str(formula).strip())
+            if m:
+                ref_sheet = m.group(1)
+                ref_col   = column_index_from_string(m.group(2))
+                ref_row   = int(m.group(3))
+                v = _read_data(prev_wb_data, ref_sheet, ref_row, ref_col)
+                if v is not None:
+                    return v
+                # Referenced sheet might itself have a formula — follow one more level
+                v2 = _resolve_cell(prev_wb_data, prev_wb_formulas, ref_sheet, ref_row, ref_col)
+                return v2
+    return None
+
+
+def _fill_rob_prev_table(wk1_ws, prev_wb, prev_wb_formulas, target_month):
+    """Fill the 'Week 1 Previous Sheet - CALCULATION ONLY' table in wk1.
+    Scans dynamically for header, year columns, and month rows.
+    Pulls Revenue from last completed week tab of prev ROB."""
+
+    month_abbrs = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"]
+
+    def _as_year(v):
+        """Try to extract a 4-digit year from a cell value (int, float, str, date)."""
+        if isinstance(v, (datetime.datetime, datetime.date)):
+            return v.year
+        if isinstance(v, (int, float)):
+            iv = int(v)
+            if 2000 <= iv <= 2100:
+                return iv
+            # Excel date serial — convert
+            if 40000 <= iv <= 60000:
+                try:
+                    d = datetime.date(1899, 12, 30) + datetime.timedelta(days=iv)
+                    return d.year
+                except Exception:
+                    pass
+        if isinstance(v, str):
+            s = v.strip()
+            if s.isdigit() and 2000 <= int(s) <= 2100:
+                return int(s)
+        return None
+
+    # ── 1. Find header cell ───────────────────────────────────────────────────
+    hdr_row = hdr_col = None
+    for r in range(1, min(wk1_ws.max_row + 1, 60)):
+        for c in range(1, wk1_ws.max_column + 1):
+            val = str(wk1_ws.cell(r, c).value or "").strip().lower()
+            if "week 1 previous" in val or ("calculation only" in val and "week" in val):
+                hdr_row, hdr_col = r, c
+                break
+        if hdr_row:
+            break
+    if not hdr_row:
+        return "Week 1 Previous Sheet table not found in wk one"
+
+    years_in_order = [target_month.year - 3, target_month.year - 2,
+                      target_month.year - 1, target_month.year]
+
+    # ── 2. Find month label column first (Jan/Feb… to the LEFT of year cols) ─
+    month_label_col = None
+    for r in range(hdr_row + 1, hdr_row + 35):
+        for c in range(max(1, hdr_col - 5), hdr_col + 5):
+            v = str(wk1_ws.cell(r, c).value or "").strip().lower()
+            if v in month_abbrs:
+                month_label_col = c
+                break
+        if month_label_col:
+            break
+    if not month_label_col:
+        return "Could not find month label column in Week 1 Previous Sheet table"
+
+    # ── 3. Collect all month rows using that exact column ─────────────────────
+    dest_month_row = {}  # month_idx (0-based) → row
+    for r in range(hdr_row + 1, hdr_row + 35):
+        v = str(wk1_ws.cell(r, month_label_col).value or "").strip().lower()
+        if v in month_abbrs:
+            dest_month_row[month_abbrs.index(v)] = r
+    if not dest_month_row:
+        return "Could not find month rows in Week 1 Previous Sheet table"
+
+    # ── 4. Find year columns — scan to the RIGHT of month label col ───────────
+    year_start_col = month_label_col + 1
+    dest_year_col = {}  # year (int) → col in new wk1
+
+    for dr in range(1, 8):
+        # Try parsing actual year values
+        parsed = {}
+        for c in range(year_start_col, year_start_col + 20):
+            yr = _as_year(wk1_ws.cell(hdr_row + dr, c).value)
+            if yr:
+                parsed[yr] = c
+        if parsed:
+            dest_year_col = parsed
+            break
+        # Fallback: find non-empty cells positionally (formulas count as non-empty)
+        non_empty = []
+        for c in range(year_start_col, year_start_col + 20):
+            v = wk1_ws.cell(hdr_row + dr, c).value
+            if v is not None and str(v).strip():
+                non_empty.append(c)
+        if len(non_empty) >= 2:
+            for i, c in enumerate(non_empty[:4]):
+                dest_year_col[years_in_order[i]] = c
+            break
+
+    if not dest_year_col:
+        return "Could not find year columns in Week 1 Previous Sheet table"
+
+    # ── 4. Build ordered list of week sheet names (most recent first) ────────
+    wk_order = ["wk six", "wk five", "wk four", "wk three", "wk two", "wk one"]
+    wk_sheet_names = []  # sheet names in prev ROB, most-recent first
+    for wk_try in wk_order:
+        matches = [s for s in prev_wb.sheetnames if wk_try in s.lower()]
+        if matches:
+            wk_sheet_names.append(matches[0])
+    if not wk_sheet_names:
+        return "No week tabs found in previous ROB"
+
+    # ── 5. Year → source col: scan wk one row 4 for dates/years ─────────────
+    base_year = target_month.year
+    src_year_col = {base_year - 3: 2, base_year - 2: 3, base_year - 1: 4, base_year: 5}
+
+    wk1_sheet_name = wk_sheet_names[-1]  # wk one is last in most-recent-first list
+    ref_ws = prev_wb[wk1_sheet_name]
+    detected = {}
+    for c in range(1, min(ref_ws.max_column + 1, 20)):
+        yr = _as_year(ref_ws.cell(4, c).value)
+        if yr and 2000 <= yr <= 2100:
+            detected[yr] = c
+    if len(detected) >= 3:
+        src_year_col = detected
+
+    # ── 6. Write Revenue values — check each cell individually ───────────────
+    # For each (month, year) cell: walk week tabs most-recent→oldest.
+    # Each cell is checked on its own — some are hardcoded numbers, some are
+    # formulas pointing elsewhere. _resolve_cell handles both cases.
+    for month_idx, dest_row in dest_month_row.items():
+        rev_row = 4 + 8 * month_idx + 1
+        for year, dest_col in dest_year_col.items():
+            src_col = src_year_col.get(year)
+            if not src_col:
+                continue
+            v = None
+            for sheet_name in wk_sheet_names:
+                v = _resolve_cell(prev_wb, prev_wb_formulas, sheet_name, rev_row, src_col)
+                if v is not None and not is_formula(str(v)):
+                    break  # found a real value in this tab — use it
+                v = None   # reset if None or formula string slipped through
+            if v is not None:
+                wk1_ws.cell(dest_row, dest_col).value = v
+
+    return None
+
+
 def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_sheet_name):
     """Fill one ROB sheet tab with historical data."""
     from openpyxl.utils import get_column_letter
@@ -1336,31 +1529,37 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
     prev_idx    = target_idx - 1           # most recently completed month (Jun = 5)
     # LY col → new col shift: LY has [2022,2023,2024,2025], new needs [2023,2024,2025,2026]
     ly_to_new   = {3: 2, 4: 3, 5: 4}
-    # Row offsets within a block that carry real data
-    data_offsets = [0, 1, 2, 3, 4, 5, 6, 7]  # 0=date header, 1-7=data rows
+    # Row offsets: skip 0 (date header) and 7 (PICKUP WoW) — both stay as template formulas
+    data_offsets = [1, 2, 3, 4, 5, 6]  # Revenue through Group Rm ADR
+
+    # ── Write as-of date row for wk one ──────────────────────────────────────
+    if is_wk_one:
+        as_of = [_rob_as_of_date(target_month.year - 3 + i, target_month.month)
+                 for i in range(4)]  # cols 2,3,4,5
+        for month_idx in range(12):
+            r = 4 + 8 * month_idx  # offset 0 = block_start date row
+            for i, d in enumerate(as_of):
+                new_ws.cell(r, i + 2).value = d
 
     for month_idx in range(12):
         block_start = 4 + 8 * month_idx
 
-        if month_idx < target_idx:
-            # ── Past month ────────────────────────────────────────────────────
+        if month_idx < prev_idx:
+            # ── Older past months (Jan–May when target=Jul) ───────────────────
+            # Copy cols 2,3,4,5 from prev ROB — these are fully settled
             if not _is_rob_month_blank(new_ws, block_start):
-                continue  # already has data — never overwrite
+                continue
 
             if is_wk_one:
-                # Copy from prev month ROB
                 if prev_ws is None:
                     continue
-                # Include col 5 (current year) only for months older than prev month
-                cols = [2, 3, 4] + ([5] if month_idx < prev_idx else [])
                 for dr in data_offsets:
                     r = block_start + dr
-                    for c in cols:
+                    for c in [2, 3, 4, 5]:
                         v = prev_ws.cell(r, c).value
                         if v is not None and not is_formula(str(v)):
                             new_ws.cell(r, c).value = v
             else:
-                # Formula referencing exact wk one cell
                 for dr in data_offsets:
                     r = block_start + dr
                     for c in [2, 3, 4, 5]:
@@ -1368,10 +1567,13 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                         new_ws.cell(r, c).value = f"='{wk_one_sheet_name}'!{col_ltr}{r}"
 
         else:
-            # ── Current month or future month ─────────────────────────────────
+            # ── Previous month + current/future months ────────────────────────
+            # Cols 2,3,4 come from LY ROB (final numbers land in week 1 of next month)
+            # Col 5 (current year) is left blank — filled by BOB upload
             if ly_ws is None:
                 continue
-            # Date header + data rows: shift LY cols 3,4,5 → new cols 2,3,4
+            if not _is_rob_month_blank(new_ws, block_start) and month_idx < target_idx:
+                continue  # prev month already has data — don't overwrite
             for dr in data_offsets:
                 r = block_start + dr
                 for ly_col, new_col in ly_to_new.items():
@@ -1430,10 +1632,12 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     prev_result, _ = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB",
                                              month_date=prev_month_dt)
     prev_wb = None
+    prev_wb_formulas = None
     if prev_result:
         try:
-            prev_wb = openpyxl.load_workbook(
-                io.BytesIO(drive_download(service, prev_result[0])), data_only=True)
+            prev_bytes = drive_download(service, prev_result[0])
+            prev_wb = openpyxl.load_workbook(io.BytesIO(prev_bytes), data_only=True)
+            prev_wb_formulas = openpyxl.load_workbook(io.BytesIO(prev_bytes), data_only=False)
         except Exception:
             pass
 
@@ -1453,17 +1657,25 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     for sheet_name in ROB_SHEETS:
         if sheet_name not in new_wb.sheetnames:
             continue
-        new_ws = new_wb[sheet_name]
+        new_ws  = new_wb[sheet_name]
         prev_ws = prev_wb[sheet_name] if prev_wb and sheet_name in prev_wb.sheetnames else None
         ly_ws   = ly_wb[sheet_name]   if ly_wb   and sheet_name in ly_wb.sheetnames   else None
         is_wk_one = (sheet_name == wk_one_name)
         _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_name)
 
+    # ── Fill Week 1 Previous Sheet table in wk one ───────────────────────────
+    warnings = []
+    if prev_wb and wk_one_name in new_wb.sheetnames:
+        err = _fill_rob_prev_table(new_wb[wk_one_name], prev_wb, prev_wb_formulas, target_month)
+        if err:
+            warnings.append(f"Prev table: {err}")
+
     strip_tables(new_wb)
     out = io.BytesIO()
     new_wb.save(out)
     drive_upload(service, new_file_id, out.getvalue(), new_file_name)
-    return new_file_name, None
+    warn_str = "; ".join(warnings) if warnings else None
+    return new_file_name, warn_str
 
 
 def find_forecast_master(service, hotel_id: str):
@@ -2174,9 +2386,16 @@ with st.container(border=True):
         start_new_month = st.checkbox("Set up new month", key="drive_new_month")
 if start_new_month:
     with st.container(border=True):
-        next_month_dt = (datetime.date.today().replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
-        month_kw      = next_month_dt.strftime("%b%Y").upper()
-        st.caption(f"Setting up workbooks for **{next_month_dt.strftime('%B %Y')}**")
+        today         = datetime.date.today()
+        cur_month_dt  = today.replace(day=1)
+        next_month_dt = (cur_month_dt + datetime.timedelta(days=32)).replace(day=1)
+        month_options = {
+            cur_month_dt.strftime("%B %Y"):  cur_month_dt,
+            next_month_dt.strftime("%B %Y"): next_month_dt,
+        }
+        sel_month_label = st.selectbox("Month to set up", list(month_options.keys()), key="setup_month_sel")
+        setup_month_dt  = month_options[sel_month_label]
+        month_kw        = setup_month_dt.strftime("%b%Y").upper()
 
         rob_col, sr_col = st.columns(2)
 
@@ -2188,13 +2407,31 @@ if start_new_month:
                     svc         = get_drive_service()
                     hotel_id_nm = hotel_id_map.get(hotel_sel, "")
                     with st.spinner("Setting up ROB — this may take a moment..."):
-                        rob_name, rob_err = setup_new_rob_month(svc, hotel_id_nm, hotel_sel, next_month_dt)
+                        rob_name, rob_err = setup_new_rob_month(svc, hotel_id_nm, hotel_sel, setup_month_dt)
                     if rob_err and not rob_name:
-                        st.error(f"ROB setup error: {rob_err}")
+                        if "storageQuotaExceeded" in str(rob_err):
+                            _, master_name = find_rob_master(svc, hotel_id_nm)
+                            rob_suffix = hotel_sel.upper()
+                            if master_name and "ROB" in master_name.upper():
+                                after = master_name[master_name.upper().find("ROB") + 3:].strip()
+                                after = after.replace(".xlsx","").replace(".xlsm","").replace(".XLSX","").replace(".XLSM","").strip()
+                                if after:
+                                    rob_suffix = after
+                            ext = ".xlsm" if master_name and master_name.lower().endswith(".xlsm") else ".xlsx"
+                            suggested_name = f"{month_kw} ROB {rob_suffix}{ext}"
+                            st.warning(
+                                f"Auto-copy requires a Shared Drive. Do this in Google Drive first:\n\n"
+                                f"1. Right-click **{master_name or 'the ROB master'}** → *Make a copy*\n"
+                                f"2. Rename to: **`{suggested_name}`**\n"
+                                f"3. Move into the **{month_kw}** folder\n\n"
+                                f"Then click **Set Up New ROB** again."
+                            )
+                        else:
+                            st.error(f"ROB setup error: {rob_err}")
                     else:
                         if rob_err:
                             st.warning(rob_err)
-                        st.success(f"**{rob_name}** ready for {next_month_dt.strftime('%B %Y')}.")
+                        st.success(f"**{rob_name}** ready for {setup_month_dt.strftime('%B %Y')}.")
                 except Exception as e:
                     st.error(f"ROB setup error: {e}")
 
@@ -2209,11 +2446,11 @@ if start_new_month:
                     # Step 1 — ensure the file exists; skip copy if it's already there
                     with st.spinner("Step 1 / 3 — locating or creating workbook..."):
                         existing, find_err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
-                                                              "Strategy Report", month_date=next_month_dt)
+                                                              "Strategy Report", month_date=setup_month_dt)
                         if existing:
                             st.info(f"Found existing file: **{existing[1]}** — skipping copy.")
                         else:
-                            created_name, create_err = setup_new_sr_month(svc, hotel_id_nm, hotel_sel, next_month_dt)
+                            created_name, create_err = setup_new_sr_month(svc, hotel_id_nm, hotel_sel, setup_month_dt)
                             if create_err:
                                 master_id, master_name = find_sr_master(svc, hotel_id_nm)
                                 hotel_suffix = ""
@@ -2234,8 +2471,8 @@ if start_new_month:
 
                     # Step 2 — load reference workbooks into memory
                     with st.spinner("Step 2 / 3 — loading reference workbooks..."):
-                        prev_month_dt    = (next_month_dt - datetime.timedelta(days=1)).replace(day=1)
-                        ly_month_dt      = next_month_dt.replace(year=next_month_dt.year - 1)
+                        prev_month_dt    = (setup_month_dt - datetime.timedelta(days=1)).replace(day=1)
+                        ly_month_dt      = setup_month_dt.replace(year=setup_month_dt.year - 1)
                         prev_month_sr_wb = _load_wb_from_drive(svc, hotel_id_nm, hotel_sel, "Strategy Report", prev_month_dt, data_only=False)
                         ly_sr_wb         = _load_wb_from_drive(svc, hotel_id_nm, hotel_sel, "Strategy Report", ly_month_dt)
                     st.info(f"Prev month ({prev_month_dt.strftime('%b %Y')}): {'✓' if prev_month_sr_wb else '✗ not found'}")
@@ -2244,7 +2481,7 @@ if start_new_month:
                     # Step 3 — populate all 5 weeks
                     with st.spinner("Step 3 / 3 — populating all weeks..."):
                         result, err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
-                                                             "Strategy Report", month_date=next_month_dt)
+                                                             "Strategy Report", month_date=setup_month_dt)
                         if err:
                             st.error(f"Cannot open new workbook: {err}")
                             st.stop()
@@ -2252,11 +2489,11 @@ if start_new_month:
                         wb_bytes = drive_download(svc, file_id)
                         original_bytes = wb_bytes
                         wb       = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
-                        restructure_sr_dates(wb, next_month_dt)
+                        restructure_sr_dates(wb, setup_month_dt)
                         first_ws = wb[STRATEGY_SHEETS[0]] if STRATEGY_SHEETS[0] in wb.sheetnames else None
                         num_rows = _count_sheet_data_rows(first_ws) if first_ws else 365
-                        full_scope_start = next_month_dt
-                        full_scope_end   = next_month_dt + datetime.timedelta(days=max(0, num_rows - 1))
+                        full_scope_start = setup_month_dt
+                        full_scope_end   = setup_month_dt + datetime.timedelta(days=max(0, num_rows - 1))
                         total_written = 0
                         for sheet_name in STRATEGY_SHEETS:
                             if sheet_name not in wb.sheetnames:
@@ -2279,7 +2516,7 @@ if start_new_month:
                         }
 
                     st.success(
-                        f"**{file_name}** is set up for {next_month_dt.strftime('%B %Y')}. "
+                        f"**{file_name}** is set up for {setup_month_dt.strftime('%B %Y')}. "
                         f"Populated **{total_written}** cells across all weeks."
                     )
                 except Exception as e:
