@@ -15,7 +15,7 @@ MONTH_ABBR = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
 }
-DAILY_RE = re.compile(r"^\d{2}-\d{2}-\d{4}")
+DAILY_RE = re.compile(r"^\d{1,2}[/-]\d{1,2}[/-]\d{4}")
 
 
 def is_formula(value) -> bool:
@@ -35,8 +35,9 @@ def classify_row(date_str: str):
         return None, None
     date_str = date_str.strip()
     if DAILY_RE.match(date_str):
+        raw = date_str[:10].replace("/", "-")
         try:
-            d = datetime.datetime.strptime(date_str[:10], "%m-%d-%Y").date()
+            d = datetime.datetime.strptime(raw, "%m-%d-%Y").date()
             return "daily", d
         except ValueError:
             return None, None
@@ -497,7 +498,9 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name):
         if isinstance(v, datetime.datetime): d = v.date()
         elif isinstance(v, datetime.date):   d = v
         else: continue
-        this_year = d.replace(year=d.year + 1)
+        # Shift +1 day to match DOW: DOW shifts by 1 in a non-leap year, so
+        # LY July 2 (Wed) should fill TY July 1 (Wed), not LY July 1 (Tue).
+        this_year = d.replace(year=d.year + 1) - datetime.timedelta(days=1)
         row_data = {}
         for ly_dest, ty_src in LY_FROM_TY.items():
             src_col = col_map.get(ty_src)
@@ -561,7 +564,6 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
     if ly_wb:
         ly_data = _extract_ly_data_from_wb(ly_wb, sheet_name)
 
-
     changes = []
 
     # Today's date above the OTB TY TRANS header
@@ -603,6 +605,8 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
         ly_date_row, _ = find_otb_date_cell(ly_ws_src)
         ly_src_date = ly_ws_src.cell(ly_date_row, date_col).value if ly_date_row >= 1 else None
         if ly_src_date:
+            if isinstance(ly_src_date, datetime.datetime):
+                ly_src_date = ly_src_date.date()
             hdr_row = next((r for r in range(2, 6) if str(ws.cell(r, ly_trans_col).value or "").strip()), 3)
             label_row = hdr_row - 1
             if label_row >= 1:
@@ -610,7 +614,7 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
                     "date": None, "row": label_row, "col": ly_trans_col,
                     "label": "OTB LY Trans as-of date",
                     "new_value": ly_src_date,
-                    "skip_reason": "formula" if is_formula(ws.cell(label_row, ly_trans_col).value) else None,
+                    "skip_reason": None,
                 })
 
     # ── CSV-sourced TY columns (only when BOB uploaded) ──────────────────────
@@ -630,10 +634,10 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
             if excel_col is None:
                 continue
             val = safe_float(row[csv_col])
-            skip = "formula" if is_formula(ws.cell(excel_row, excel_col).value) else None
+            # BOB data is always authoritative — write even if cell has a template formula
             changes.append({
                 "date": d, "row": excel_row, "col": excel_col,
-                "label": label, "new_value": val, "skip_reason": skip,
+                "label": label, "new_value": val, "skip_reason": None,
             })
 
     # ── Drive-sourced columns (run every time, no CSV needed) ─────────────────
@@ -665,18 +669,16 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
             ]:
                 dest_col = col_map.get(ly_field)
                 if dest_col and ly_field in row_ly:
-                    skip = "formula" if is_formula(ws.cell(excel_row, dest_col).value) else None
                     changes.append({
                         "date": d, "row": excel_row, "col": dest_col,
-                        "label": ly_label, "new_value": row_ly[ly_field], "skip_reason": skip,
+                        "label": ly_label, "new_value": row_ly[ly_field], "skip_reason": None,
                     })
 
             # Comp set far-right (LY) ← far-left (TY) from last year
             if comp_ly_col_cur and "comp_set_ly" in row_ly:
-                skip = "formula" if is_formula(ws.cell(excel_row, comp_ly_col_cur).value) else None
                 changes.append({
                     "date": d, "row": excel_row, "col": comp_ly_col_cur,
-                    "label": "Comp Set LY", "new_value": row_ly["comp_set_ly"], "skip_reason": skip,
+                    "label": "Comp Set LY", "new_value": row_ly["comp_set_ly"], "skip_reason": None,
                 })
 
     return changes
@@ -1529,33 +1531,25 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
     prev_idx    = target_idx - 1           # most recently completed month (Jun = 5)
     # LY col → new col shift: LY has [2022,2023,2024,2025], new needs [2023,2024,2025,2026]
     ly_to_new   = {3: 2, 4: 3, 5: 4}
-    # Row offsets: skip 0 (date header) and 7 (PICKUP WoW) — both stay as template formulas
-    data_offsets = [1, 2, 3, 4, 5, 6]  # Revenue through Group Rm ADR
-
-    # ── Write as-of date row for wk one ──────────────────────────────────────
-    if is_wk_one:
-        as_of = [_rob_as_of_date(target_month.year - 3 + i, target_month.month)
-                 for i in range(4)]  # cols 2,3,4,5
-        for month_idx in range(12):
-            r = 4 + 8 * month_idx  # offset 0 = block_start date row
-            for i, d in enumerate(as_of):
-                new_ws.cell(r, i + 2).value = d
+    # All row offsets within a block, including date header (0) and PICKUP WoW (7)
+    data_offsets = [0, 1, 2, 3, 4, 5, 6, 7]
 
     for month_idx in range(12):
         block_start = 4 + 8 * month_idx
 
-        if month_idx < prev_idx:
-            # ── Older past months (Jan–May when target=Jul) ───────────────────
-            # Copy cols 2,3,4,5 from prev ROB — these are fully settled
+        if month_idx < target_idx:
+            # ── Past months (Jan–Jun when target=Jul) ────────────────────────
             if not _is_rob_month_blank(new_ws, block_start):
                 continue
 
             if is_wk_one:
                 if prev_ws is None:
                     continue
+                # Include col 5 (current year) only for months older than prev month
+                cols = [2, 3, 4] + ([5] if month_idx < prev_idx else [])
                 for dr in data_offsets:
                     r = block_start + dr
-                    for c in [2, 3, 4, 5]:
+                    for c in cols:
                         v = prev_ws.cell(r, c).value
                         if v is not None and not is_formula(str(v)):
                             new_ws.cell(r, c).value = v
@@ -1567,13 +1561,10 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                         new_ws.cell(r, c).value = f"='{wk_one_sheet_name}'!{col_ltr}{r}"
 
         else:
-            # ── Previous month + current/future months ────────────────────────
-            # Cols 2,3,4 come from LY ROB (final numbers land in week 1 of next month)
-            # Col 5 (current year) is left blank — filled by BOB upload
+            # ── Current month and future months ───────────────────────────────
+            # Cols 2,3,4 from LY ROB; col 5 (current year) left blank for BOB upload
             if ly_ws is None:
                 continue
-            if not _is_rob_month_blank(new_ws, block_start) and month_idx < target_idx:
-                continue  # prev month already has data — don't overwrite
             for dr in data_offsets:
                 r = block_start + dr
                 for ly_col, new_col in ly_to_new.items():
@@ -2573,6 +2564,16 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
             avail    = [s for s in STRATEGY_SHEETS if s in wb.sheetnames]
             auto     = first_uncolored_sheet(wb, avail)
             sheet    = auto or avail[0]
+            date_row_map_debug = build_date_row_map(wb)
+            st.info(f"SR: **{file_name}** → sheet **{sheet}** | "
+                    f"date rows mapped: {len(date_row_map_debug)} | "
+                    f"date range: {min(date_row_map_debug) if date_row_map_debug else 'none'} – {max(date_row_map_debug) if date_row_map_debug else 'none'}")
+            if df is not None:
+                sample_dates = [str(df.iloc[i, 0]) for i in range(min(5, len(df)))]
+                bob_daily = sum(1 for _, r in df.iterrows() if classify_row(str(r[0]).strip())[0] == "daily")
+                st.info(f"BOB CSV: {len(df)} rows | daily rows matched: {bob_daily} | first 5 col-0 values: {sample_dates}")
+            else:
+                st.warning("BOB CSV: df is None — no CSV uploaded or parse failed")
             changes  = build_strategy_change_plan(df, wb, sheet,
                                                    prev_month_wb=prev_month_sr_wb,
                                                    ly_wb=ly_sr_wb)
