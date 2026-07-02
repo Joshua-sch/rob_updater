@@ -22,6 +22,10 @@ def is_formula(value) -> bool:
     return isinstance(value, str) and value.strip().startswith("=")
 
 
+def is_datelike(value) -> bool:
+    return isinstance(value, (datetime.datetime, datetime.date))
+
+
 def parse_csv(file_bytes: bytes) -> pd.DataFrame:
     raw = pd.read_csv(io.BytesIO(file_bytes), header=None, dtype=str, encoding="utf-8-sig")
     df = raw.iloc[2:].reset_index(drop=True)
@@ -1608,7 +1612,7 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                     r = block_start + dr
                     for c in [2, 3, 4, 5]:
                         v = prev_ws.cell(r, c).value
-                        if v is not None and not is_formula(str(v)):
+                        if v is not None and not is_formula(str(v)) and not is_datelike(v):
                             new_ws.cell(r, c).value = v
             else:
                 for dr in data_offsets:
@@ -1629,13 +1633,13 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                         r = block_start + dr
                         for ly_col, new_col in ly_to_new.items():
                             v = ly_ws.cell(r, ly_col).value
-                            if v is not None and not is_formula(str(v)):
+                            if v is not None and not is_formula(str(v)) and not is_datelike(v):
                                 new_ws.cell(r, new_col).value = v
                     ly_sec_col = find_secondary_col(ly_ws, block_start) or 7
                     for dr in [4, 5, 6]:
                         r = block_start + dr
                         v = ly_ws.cell(r, ly_sec_col).value
-                        if v is not None and not is_formula(str(v)):
+                        if v is not None and not is_formula(str(v)) and not is_datelike(v):
                             new_ws.cell(r, 8).value = v
             else:
                 for dr in data_offsets:
@@ -1652,13 +1656,13 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                 r = block_start + dr
                 for ly_col, new_col in ly_to_new.items():
                     v = ly_ws.cell(r, ly_col).value
-                    if v is not None and not is_formula(str(v)):
+                    if v is not None and not is_formula(str(v)) and not is_datelike(v):
                         new_ws.cell(r, new_col).value = v
             ly_sec_col = find_secondary_col(ly_ws, block_start) or 7
             for dr in [4, 5, 6]:
                 r = block_start + dr
                 v = ly_ws.cell(r, ly_sec_col).value
-                if v is not None and not is_formula(str(v)):
+                if v is not None and not is_formula(str(v)) and not is_datelike(v):
                     new_ws.cell(r, 8).value = v
 
 
