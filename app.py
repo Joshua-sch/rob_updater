@@ -198,8 +198,8 @@ STRATEGY_FIELD_PATTERNS = {
     "grp_rev_ty":      [("GRP TY", "REV"),               ("GRP!LY!N/PU", "REV TY")],
     "otb_lst_wk":      [("OTB", "LST WEK"),               ("OTB", "LST WK"),         ("OTB", "LAST WK"), ("OTB LST", None)],
     # ── LY columns (written from last year's SR) ───────────────────────────────
-    "otb_ly_trans":    [("OTB LY", "TRANS"),             ("TRANS!TY", "SOLD!TY"),   ("LY", "TRANS!TY")],
-    "grp_pu_ly":       [("GRP PU", "LY"),                ("GROUP!TY", "LY"),        ("GRP PU LY", None)],
+    "otb_ly_trans":    [("LY", "TRAN"),                  ("OTB LY", "TRANS"),       ("TRANS!TY", "SOLD!TY"), ("LY", "TRANS!TY")],
+    "grp_pu_ly":       [("LY", "GRP"),                   ("GRP PU", "LY"),          ("GROUP!TY", "LY"),        ("GRP PU LY", None)],
     "grp_npu_ly":      [("GRP N/PU", "LY"),              ("N/PU LY", None),         ("GRP RMS", "LY")],
     "trans_rev_ly":    [("LY TRANS", "REV"),             ("TRAN!TY", "REV LY"),     ("LY", "TRANS REV")],
     "grp_rev_ly":      [("GRP LY", "REV"),               ("GRP!TY!N/PU", "REV LY")],
@@ -215,7 +215,6 @@ LY_FROM_TY = {
     "grp_rev_ly":     "grp_rev_ty",
     "grp_npu_rev_ly": "grp_npu_ty",  # source is GRP N/PU TY
 }
-
 
 def _kw_matches(cell_val, keyword, r3_val, r4_val):
     """Check if keyword matches cell_val.
@@ -235,8 +234,12 @@ def _kw_matches(cell_val, keyword, r3_val, r4_val):
 
 
 def detect_strategy_columns(ws):
-    """Scan rows 3+4 of ws and return {field_key: col_index} for each field.
-    Raises ValueError listing any fields that could not be found.
+    """Scan rows 3+4 of THIS sheet and return {field_key: col_index} for each
+    field. Every sheet is re-scanned independently — never assume two sheets
+    (even in the same workbook/hotel) share column positions. Week-1 vs
+    week-2+ tabs can differ (e.g. an extra pickup-tracking column shifts
+    everything after it), so a value pinned from one sheet can silently be
+    wrong on another.
     """
     max_col = ws.max_column
     # Build lookup: col → (r3_text, r4_text)
@@ -312,10 +315,11 @@ def detect_comp_set_columns(ws, col_map):
     if not trans_rev_col:
         return None, None
 
-    # Find Restrictions column — header may be split across r3/r4 (e.g. "Restric"+"tions")
+    # Find Restrictions column — header may be split across r3/r4 and hyphenated
+    # (e.g. "Restric"+"tions", or "Restri-"+"ctions")
     restrict_col = None
     for c in range(1, trans_rev_col):
-        combined_hdr = (str(ws.cell(3, c).value or "") + str(ws.cell(4, c).value or "")).upper().replace(" ", "")
+        combined_hdr = (str(ws.cell(3, c).value or "") + str(ws.cell(4, c).value or "")).upper().replace(" ", "").replace("-", "")
         if "RESTRICT" in combined_hdr:
             restrict_col = c
             break
@@ -681,6 +685,44 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
                     "label": "Comp Set LY", "new_value": row_ly["comp_set_ly"], "skip_reason": None,
                 })
 
+    # ── Blank LY cells with no confirmed LY data — don't leave stale leftovers
+    # from whatever the template last held (e.g. a day with no LY rates). Only
+    # runs when last year's SR actually loaded, so a missing/failed ly_wb never
+    # wipes cells out of ignorance.
+    if ly_wb:
+        ly_field_labels = [
+            ("otb_ly_trans",   "OTB LY Trans"),
+            ("grp_pu_ly",      "GRP PU LY"),
+            ("grp_npu_ly",     "GRP N/PU LY"),
+            ("trans_rev_ly",   "LY Trans Rev"),
+            ("grp_rev_ly",     "GRP LY Rev"),
+            ("grp_npu_rev_ly", "GRP N/PU LY Rev"),
+        ]
+        for d, excel_row in date_row_map.items():
+            if d < scope_start or d > scope_end:
+                continue
+            row_ly = ly_data.get(d, {})
+            for ly_field, ly_label in ly_field_labels:
+                dest_col = col_map.get(ly_field)
+                if not dest_col or ly_field in row_ly:
+                    continue
+                cur_val = ws.cell(excel_row, dest_col).value
+                if cur_val is None or is_formula(cur_val):
+                    continue
+                changes.append({
+                    "date": d, "row": excel_row, "col": dest_col,
+                    "label": f"{ly_label} (no LY data — cleared)",
+                    "new_value": None, "skip_reason": None,
+                })
+            if comp_ly_col_cur and "comp_set_ly" not in row_ly:
+                cur_val = ws.cell(excel_row, comp_ly_col_cur).value
+                if cur_val is not None and not is_formula(cur_val):
+                    changes.append({
+                        "date": d, "row": excel_row, "col": comp_ly_col_cur,
+                        "label": "Comp Set LY (no LY data — cleared)",
+                        "new_value": None, "skip_reason": None,
+                    })
+
     return changes
 
 
@@ -980,14 +1022,14 @@ def build_forecast_change_plan(df, ws, rob_wb=None, is_wk1=False):
     })
 
     # Build lookup from CSV: date -> row dict
+    # Uses the same flexible date matching as ROB/SR (classify_row) — the BOB
+    # CSV's date format (1-2 digit month/day, "/" or "-") wasn't matching the
+    # old hyphen-only, zero-padded regex here, so Forecast silently got no data.
     daily_rows = {}
     for _, row in df.iterrows():
         date_str = str(row.iloc[0]).strip()
-        if not re.match(r"^\d{2}-\d{2}-\d{4}", date_str):
-            continue
-        try:
-            d = datetime.datetime.strptime(date_str[:10], "%m-%d-%Y").date()
-        except ValueError:
+        kind, d = classify_row(date_str)
+        if kind != "daily":
             continue
         daily_rows[d] = row
 
@@ -1089,11 +1131,8 @@ def build_next_month_forecast_plan(df, ws):
     daily_rows = {}
     for _, row in df.iterrows():
         date_str = str(row.iloc[0]).strip()
-        if not re.match(r"^\d{2}-\d{2}-\d{4}", date_str):
-            continue
-        try:
-            d = datetime.datetime.strptime(date_str[:10], "%m-%d-%Y").date()
-        except ValueError:
+        kind, d = classify_row(date_str)
+        if kind != "daily":
             continue
         daily_rows[d] = row
 
@@ -1592,9 +1631,10 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                             v = ly_ws.cell(r, ly_col).value
                             if v is not None and not is_formula(str(v)):
                                 new_ws.cell(r, new_col).value = v
+                    ly_sec_col = find_secondary_col(ly_ws, block_start) or 7
                     for dr in [4, 5, 6]:
                         r = block_start + dr
-                        v = ly_ws.cell(r, 8).value
+                        v = ly_ws.cell(r, ly_sec_col).value
                         if v is not None and not is_formula(str(v)):
                             new_ws.cell(r, 8).value = v
             else:
@@ -1614,9 +1654,10 @@ def _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_shee
                     v = ly_ws.cell(r, ly_col).value
                     if v is not None and not is_formula(str(v)):
                         new_ws.cell(r, new_col).value = v
+            ly_sec_col = find_secondary_col(ly_ws, block_start) or 7
             for dr in [4, 5, 6]:
                 r = block_start + dr
-                v = ly_ws.cell(r, 8).value
+                v = ly_ws.cell(r, ly_sec_col).value
                 if v is not None and not is_formula(str(v)):
                     new_ws.cell(r, 8).value = v
 
@@ -2010,6 +2051,8 @@ def _count_sheet_data_rows(ws):
 
 def restructure_sr_dates(wb, target_month):
     """Restructure the three date columns in every strategy sheet for a new month.
+    Row 4 (header):    col 1 = LY year, col 3 = TY year — else stale years carry
+                        over from whatever the master template last had.
     Col 1 (LY date):   starts at day 2 of target_month, last year
     Col 2 (day of wk): abbreviation matching the TY date in col 3
     Col 3 (TY date):   starts at day 1 of target_month, this year
@@ -2022,6 +2065,8 @@ def restructure_sr_dates(wb, target_month):
         if sheet_name not in wb.sheetnames:
             continue
         ws = wb[sheet_name]
+        ws.cell(4, 1).value = ly_start.year
+        ws.cell(4, 3).value = ty_start.year
         num_rows = min(_count_sheet_data_rows(ws), 365)
         if num_rows == 0:
             continue
