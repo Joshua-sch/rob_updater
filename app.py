@@ -150,12 +150,19 @@ def apply_rob_changes(wb, sheet_name, changes):
         ws.cell(ch["row"], ch["col"]).value = ch["new_value"]
 
 
+DONE_TAB_RGB = "FF00B050"  # green — set by color_tab_done() when a week is genuinely complete
+
+
 def first_uncolored_sheet(wb, sheet_names):
-    """Return the first sheet in sheet_names whose tab has no color set."""
+    """Return the first sheet in sheet_names not marked done (our green).
+    A master template can have its own unrelated tab color baked in (e.g. a
+    legacy marker on 'wk one') — only our own green 'done' color counts as
+    done, otherwise a real upload silently skips a week that isn't finished.
+    """
     for name in sheet_names:
         ws = wb[name]
         tc = ws.sheet_properties.tabColor
-        if tc is None:
+        if tc is None or getattr(tc, "rgb", None) != DONE_TAB_RGB:
             return name
     return sheet_names[-1]  # fallback: last sheet
 
@@ -163,7 +170,17 @@ def first_uncolored_sheet(wb, sheet_names):
 def color_tab_done(wb, sheet_name):
     """Mark a sheet tab green to indicate it has been completed."""
     from openpyxl.styles.colors import Color
-    wb[sheet_name].sheet_properties.tabColor = Color(rgb="FF00B050")
+    wb[sheet_name].sheet_properties.tabColor = Color(rgb=DONE_TAB_RGB)
+
+
+def clear_tab_colors(wb, sheet_names):
+    """Reset tab color to none for every listed sheet. New-month setup copies
+    the master/prior file, which can carry over a stale 'done' tab color —
+    without this, a week that hasn't been touched yet can look completed and
+    get skipped by the 'first uncolored sheet' auto-detect."""
+    for name in sheet_names:
+        if name in wb.sheetnames:
+            wb[name].sheet_properties.tabColor = None
 
 
 def strip_tables(wb):
@@ -1261,6 +1278,45 @@ def drive_find_folder_by_keyword(service, keyword, parent_id=None):
     return None, None
 
 
+def _find_rev_reports_folder_for_year(service, hotel_id, year_kw):
+    """Find the REVENUE REPORTS folder to use for a given year.
+    Some hotels have ONE 'REVENUE REPORTS' folder for years directly (year/month
+    subfolders inside it); others have a SEPARATE '<year> REVENUE REPORTS <hotel>'
+    folder per year, sitting side by side. drive_find_folder_by_keyword only
+    ever returns the first match, which silently picks the wrong year's folder
+    for hotels using the per-year pattern. Prefer an exact year-name match;
+    fall back to the first REVENUE REPORTS folder found.
+    """
+    q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
+         "and '%s' in parents") % hotel_id
+    children = service.files().list(
+        q=q, fields="files(id, name)", pageSize=100,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute().get("files", [])
+    candidates = [f for f in children if "revenue reports" in f["name"].lower()]
+    year_match = next((f for f in candidates if year_kw in f["name"]), None)
+    if year_match:
+        return year_match["id"], year_match["name"]
+    if candidates:
+        return candidates[0]["id"], candidates[0]["name"]
+    return None, None
+
+
+def _find_or_create_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name):
+    """Resolve the month folder for a new-month setup, handling both layouts:
+    month folders directly inside the REVENUE REPORTS folder (common when
+    there's one REVENUE REPORTS folder per year), or nested under a year
+    subfolder. Creates the month folder if neither is found.
+    """
+    month_id, month_name = drive_find_folder_by_keyword(service, month_kw, parent_id=rev_id)
+    if month_id:
+        return month_id, month_name
+    year_id, _ = drive_find_folder_by_keyword(service, year_kw, parent_id=rev_id)
+    if year_id:
+        return drive_find_or_create_month_folder(service, rev_id, year_id, target_month, hotel_name)
+    return drive_find_or_create_month_folder(service, rev_id, rev_id, target_month, hotel_name)
+
+
 def drive_find_file(service, keyword, parent_id):
     """Return (file_id, file_name) for first xlsx whose name contains keyword,
     excluding files whose name also contains 'copy' (to skip backup copies)."""
@@ -1672,19 +1728,18 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     month_kw = target_month.strftime("%b%Y").upper()
 
     # ── Locate or create month folder ────────────────────────────────────────
-    rev_id, _ = drive_find_folder_by_keyword(service, "REVENUE REPORTS", parent_id=hotel_id)
+    rev_id, _ = _find_rev_reports_folder_for_year(service, hotel_id, year_kw)
     if not rev_id:
         return None, "No REVENUE REPORTS folder."
-    year_id, _ = drive_find_folder_by_keyword(service, year_kw, parent_id=rev_id)
-    if not year_id:
-        return None, f"No {year_kw} folder."
-    month_id, _ = drive_find_or_create_month_folder(service, rev_id, year_id, target_month, hotel_name)
+    month_id, _ = _find_or_create_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
 
     # ── Find or copy the file ─────────────────────────────────────────────────
     existing_id, existing_name = drive_find_file(service, "ROB", month_id)
+    is_fresh_copy = False
     if existing_id and "master" not in existing_name.lower():
         new_file_id, new_file_name = existing_id, existing_name
     else:
+        is_fresh_copy = True
         master_id, master_name = find_rob_master(service, hotel_id)
         if not master_id:
             return None, master_name
@@ -1705,6 +1760,8 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     # ── Load all three workbooks ──────────────────────────────────────────────
     new_wb_bytes = drive_download(service, new_file_id)
     new_wb = openpyxl.load_workbook(io.BytesIO(new_wb_bytes), data_only=False)
+    if is_fresh_copy:
+        clear_tab_colors(new_wb, ROB_SHEETS)
 
     prev_month_dt = (target_month - datetime.timedelta(days=1)).replace(day=1)
     prev_result, _ = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB",
@@ -1779,14 +1836,11 @@ def setup_new_forecast_month(service, hotel_id: str, hotel_name: str, target_mon
     year_kw  = str(target_month.year)
     month_kw = target_month.strftime("%b%Y").upper()
 
-    rev_id, _ = drive_find_folder_by_keyword(service, "REVENUE REPORTS", parent_id=hotel_id)
+    rev_id, _ = _find_rev_reports_folder_for_year(service, hotel_id, year_kw)
     if not rev_id:
         return None, "No REVENUE REPORTS folder."
-    year_id, _ = drive_find_folder_by_keyword(service, year_kw, parent_id=rev_id)
-    if not year_id:
-        return None, f"No {year_kw} folder."
 
-    month_id, _ = drive_find_or_create_month_folder(service, rev_id, year_id, target_month, hotel_name)
+    month_id, _ = _find_or_create_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
 
     # Check if Forecast already exists
     existing_id, existing_name = drive_find_file(service, "FORECAST", month_id)
@@ -1819,6 +1873,7 @@ def setup_new_forecast_month(service, hotel_id: str, hotel_name: str, target_mon
     try:
         wb_bytes  = drive_download(service, new_file_id)
         wb        = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
+        clear_tab_colors(wb, FORECAST_SHEETS)
         sheet     = FORECAST_SHEETS[0] if FORECAST_SHEETS[0] in wb.sheetnames else wb.sheetnames[1] if len(wb.sheetnames) > 1 else wb.sheetnames[0]
         ws        = wb[sheet]
         # Find "Day of Week" cell → one right + one down = start date cell
@@ -1873,16 +1928,13 @@ def setup_new_sr_month(service, hotel_id: str, hotel_name: str, target_month: da
     year_kw = str(target_month.year)
     month_kw = target_month.strftime("%b%Y").upper()
 
-    # Resolve REVENUE REPORTS and year folder
-    rev_id, _ = drive_find_folder_by_keyword(service, "REVENUE REPORTS", parent_id=hotel_id)
+    # Resolve REVENUE REPORTS and month folder
+    rev_id, _ = _find_rev_reports_folder_for_year(service, hotel_id, year_kw)
     if not rev_id:
         return None, "No REVENUE REPORTS folder."
-    year_id, _ = drive_find_folder_by_keyword(service, year_kw, parent_id=rev_id)
-    if not year_id:
-        return None, f"No {year_kw} folder."
 
     # Find or create month folder
-    month_id, month_name = drive_find_or_create_month_folder(service, rev_id, year_id, target_month, hotel_name)
+    month_id, month_name = _find_or_create_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
 
     # Check if SR already exists in that folder
     existing_id, existing_name = drive_find_file(service, "STRATEGY", month_id)
@@ -2129,13 +2181,44 @@ if LOGIN_ENABLED and not st.session_state["authenticated"]:
 
 st.markdown("""
 <style>
-  .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+  .block-container { max-width: 100% !important; padding-left: 2rem !important; padding-right: 2rem !important; }
+
+  .stTabs [data-baseweb="tab-list"] { gap: 8px; border-bottom: 1px solid #E5E7EB; }
   .stTabs [data-baseweb="tab"] {
-    background: #1C2D4E; color: #C9A84C;
+    background: #F1F3F5; color: #1E293B;
     border-radius: 6px 6px 0 0; padding: 8px 20px; font-weight: 600;
   }
-  .stTabs [aria-selected="true"] { background: #C9A84C !important; color: #0F1B2D !important; }
-  div[data-testid="metric-container"] { background: #1C2D4E; border-radius: 8px; padding: 12px; }
+  .stTabs [aria-selected="true"] {
+    background: #2563EB !important; color: #FFFFFF !important;
+    box-shadow: inset 0 -3px 0 #C9A84C;
+  }
+  div[data-testid="metric-container"] {
+    background: #F8F9FA; border: 1px solid #E5E7EB; border-left: 3px solid #C9A84C;
+    border-radius: 8px; padding: 12px;
+  }
+  button[data-testid="stBaseButton-pills"],
+  button[data-testid="stBaseButton-pillsActive"] {
+    border-radius: 8px !important;
+    border: 1.5px solid #94A3B8 !important;
+    font-size: 1.5rem !important;
+    padding: 1rem 1.8rem !important;
+  }
+  button[data-testid="stBaseButton-pillsActive"] {
+    background-color: #2563EB !important;
+    border-color: #2563EB !important;
+    color: #FFFFFF !important;
+  }
+
+  /* Larger, consistent widget labels + selectbox text app-wide */
+  label[data-testid="stWidgetLabel"] p { font-size: 1.2rem !important; }
+  div[data-testid="stSelectbox"] div[data-baseweb="select"] div { font-size: 1.25rem !important; }
+  [data-testid="stFileUploaderDropzone"] { font-size: 1.15rem !important; }
+  [data-testid="stFileUploaderDropzoneInstructions"] span { font-size: 1.15rem !important; }
+  ul[data-testid="stSelectboxVirtualDropdown"] li {
+    font-size: 1.25rem !important;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -2447,17 +2530,21 @@ with st.container(border=True):
             get_hotels_from_drive.clear()
             st.rerun()
     with col_w:
-        wb_sels = st.multiselect(
+        wb_sels = st.pills(
             "Workbooks to update",
             WORKBOOK_TYPES,
+            selection_mode="multi",
             default=WORKBOOK_TYPES,
             key="drive_wb",
-        )
+        ) or []
 
-    drive_csv = st.file_uploader("CSV — Business on the Books", type=["csv"], key="drive_csv")
+    # Keying these to the selected hotel clears any uploaded file the moment you
+    # switch hotels — one hotel's BOB/R&R CSV should never carry over and get
+    # applied to a different hotel.
+    drive_csv = st.file_uploader("CSV — Business on the Books", type=["csv"], key=f"drive_csv_{hotel_sel}", width=500)
     drive_rate_csv = None
     if "Strategy Report" in (wb_sels or []):
-        drive_rate_csv = st.file_uploader("CSV — Rates & Restrictions", type=["csv"], key="drive_rate_csv")
+        drive_rate_csv = st.file_uploader("CSV — Rates & Restrictions", type=["csv"], key=f"drive_rate_csv_{hotel_sel}", width=500)
 
     opt_col1, opt_col2 = st.columns(2)
     forecast_next_month = False
@@ -2470,12 +2557,17 @@ if start_new_month:
     with st.container(border=True):
         today         = datetime.date.today()
         cur_month_dt  = today.replace(day=1)
+        prev_month_dt = (cur_month_dt - datetime.timedelta(days=1)).replace(day=1)
         next_month_dt = (cur_month_dt + datetime.timedelta(days=32)).replace(day=1)
         month_options = {
+            prev_month_dt.strftime("%B %Y"): prev_month_dt,
             cur_month_dt.strftime("%B %Y"):  cur_month_dt,
             next_month_dt.strftime("%B %Y"): next_month_dt,
         }
-        sel_month_label = st.selectbox("Month to set up", list(month_options.keys()), key="setup_month_sel")
+        month_labels = list(month_options.keys())
+        sel_month_label = st.selectbox("Month to set up", month_labels,
+                                        index=month_labels.index(cur_month_dt.strftime("%B %Y")),
+                                        key="setup_month_sel")
         setup_month_dt  = month_options[sel_month_label]
         month_kw        = setup_month_dt.strftime("%b%Y").upper()
 
@@ -2526,12 +2618,14 @@ if start_new_month:
                     hotel_id_nm = hotel_id_map.get(hotel_sel, "")
 
                     # Step 1 — ensure the file exists; skip copy if it's already there
+                    is_fresh_copy = False
                     with st.spinner("Step 1 / 3 — locating or creating workbook..."):
                         existing, find_err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
                                                               "Strategy Report", month_date=setup_month_dt)
                         if existing:
                             st.info(f"Found existing file: **{existing[1]}** — skipping copy.")
                         else:
+                            is_fresh_copy = True
                             created_name, create_err = setup_new_sr_month(svc, hotel_id_nm, hotel_sel, setup_month_dt)
                             if create_err:
                                 master_id, master_name = find_sr_master(svc, hotel_id_nm)
@@ -2571,6 +2665,8 @@ if start_new_month:
                         wb_bytes = drive_download(svc, file_id)
                         original_bytes = wb_bytes
                         wb       = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
+                        if is_fresh_copy:
+                            clear_tab_colors(wb, STRATEGY_SHEETS)
                         restructure_sr_dates(wb, setup_month_dt)
                         first_ws = wb[STRATEGY_SHEETS[0]] if STRATEGY_SHEETS[0] in wb.sheetnames else None
                         num_rows = _count_sheet_data_rows(first_ws) if first_ws else 365
