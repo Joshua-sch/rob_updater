@@ -4,6 +4,7 @@ import openpyxl
 import io
 import re
 import datetime
+import hashlib
 import bcrypt
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -151,6 +152,18 @@ def apply_rob_changes(wb, sheet_name, changes):
 
 
 DONE_TAB_RGB = "FF00B050"  # green — set by color_tab_done() when a week is genuinely complete
+DONE_TAB_HEX = "00B050"    # same green, without the alpha channel
+
+
+def _is_done_color(rgb_value) -> bool:
+    """True if rgb_value is our green 'done' marker. Matches on the trailing
+    6 hex digits (case-insensitive) so it recognizes a tab colored directly in
+    Excel's own Tab Color picker (which often stores 6-digit RGB with no alpha
+    prefix) as well as ones this app set (8-digit ARGB) — a real week that a
+    hotel had already filled in and marked green by hand was being treated as
+    'not done' by a strict 8-char match, so the app kept re-picking it.
+    """
+    return isinstance(rgb_value, str) and rgb_value[-6:].upper() == DONE_TAB_HEX
 
 
 def first_uncolored_sheet(wb, sheet_names):
@@ -162,7 +175,22 @@ def first_uncolored_sheet(wb, sheet_names):
     for name in sheet_names:
         ws = wb[name]
         tc = ws.sheet_properties.tabColor
-        if tc is None or getattr(tc, "rgb", None) != DONE_TAB_RGB:
+        if tc is None or not _is_done_color(getattr(tc, "rgb", None)):
+            return name
+    return sheet_names[-1]  # fallback: last sheet
+
+
+def first_unhighlighted_forecast_sheet(wb, sheet_names):
+    """Return the first Forecast week tab with NO tab color at all.
+
+    Unlike ROB/Strategy Report, hotels color-code Forecast week tabs by hand
+    with whatever color they like (seen in practice: our own green, but also
+    ad-hoc magenta, bright green, etc.) to mark a week as touched/reviewed —
+    there's no single fixed 'done' color to match. So here ANY tab color means
+    the week has been dealt with; only a genuinely uncolored tab is next.
+    """
+    for name in sheet_names:
+        if wb[name].sheet_properties.tabColor is None:
             return name
     return sheet_names[-1]  # fallback: last sheet
 
@@ -336,14 +364,7 @@ def detect_comp_set_columns(ws, col_map):
     if not trans_rev_col:
         return None, None
 
-    # Find Restrictions column — header may be split across r3/r4 and hyphenated
-    # (e.g. "Restric"+"tions", or "Restri-"+"ctions")
-    restrict_col = None
-    for c in range(1, trans_rev_col):
-        combined_hdr = (str(ws.cell(3, c).value or "") + str(ws.cell(4, c).value or "")).upper().replace(" ", "").replace("-", "")
-        if "RESTRICT" in combined_hdr:
-            restrict_col = c
-            break
+    restrict_col = find_restrictions_col(ws, upto_col=trans_rev_col - 1)
 
     left_bound  = (restrict_col + 1) if restrict_col else max(1, trans_rev_col - 30)
     right_bound = trans_rev_col - 1
@@ -776,6 +797,28 @@ def find_header_col(ws, keyword, header_rows=(2, 3, 4)):
     return min(matches) if matches else None
 
 
+def find_restrictions_col(ws, upto_col=None):
+    """Find the 'Restrictions' header column, scanning rows 3-4.
+    The header can be split across those two rows AND hyphenated for
+    word-wrap (e.g. 'Restric'+'tions', or 'Restri-'+'ctions' — confirmed on
+    a real hotel's sheet, ALLEGRIA/'Long Beach'). Stripping spaces and
+    hyphens before matching handles both forms; a plain substring search on
+    the raw concatenation misses the hyphenated one and returns nothing.
+
+    Also confirmed a master template with the header simply misspelled —
+    'Restictions' (missing the second 'r') on Hampton/Ashworth By The Sea, in
+    a single cell, no split at all. Rather than chase every possible typo,
+    match on 'REST' + 'TION' both present, which covers correct spelling,
+    the hyphenated/split form, and this typo alike.
+    """
+    upto_col = upto_col or ws.max_column
+    for c in range(1, upto_col + 1):
+        combined_hdr = (str(ws.cell(3, c).value or "") + str(ws.cell(4, c).value or "")).upper().replace(" ", "").replace("-", "")
+        if "REST" in combined_hdr and "TION" in combined_hdr:
+            return c
+    return None
+
+
 def build_rates_change_plan(rate_df, wb, sheet_name):
     today = datetime.date.today()
     # include previous month — final numbers arrive on the 1st of the following month
@@ -786,7 +829,7 @@ def build_rates_change_plan(rate_df, wb, sheet_name):
     date_row_map = build_date_row_map(wb)
     ws = wb[sheet_name]
 
-    restric_col = find_header_col(ws, "restric")
+    restric_col = find_restrictions_col(ws)
     hotel_col   = (restric_col + 1) if restric_col else None
 
     changes = []
@@ -851,16 +894,64 @@ def parse_any_date(val):
     return None
 
 
-def build_forecast_date_col_map(ws, wb=None):
-    """Return {date: col_index} from row 4. Falls back to WK1 for formula-only sheets."""
-    month_start = parse_any_date(ws.cell(4, 2).value)
+def locate_forecast_rows(ws):
+    """Find the As-of date / OTB Rooms Sold / ADR OTB / actual Rooms Sold /
+    actual Revenue rows by reading column-A titles, instead of assuming fixed
+    row numbers. Confirmed on a real workbook that this drifts within a single
+    file: WK1 has an extra 'Occupancy' row that WK4/WK8/WK9 don't, shifting
+    every row below it by one — a hardcoded row 14/16/19 lands on a blank row
+    or the wrong label on most week tabs.
+
+    'Rooms Sold' and 'Revenue' each appear multiple times in this template, so
+    rows are resolved in reading order relative to the unique 'ADR OTB' label:
+    the first 'Rooms Sold' above it is the OTB (future) entry row, the first
+    'Rooms Sold' below it is the actual entry row, and the first 'Revenue'
+    below that is the actual revenue row.
+
+    Returns None if the expected labels aren't all found (caller should warn
+    and skip rather than guess a row number).
+    """
+    labels = []
+    for r in range(1, 31):
+        v = ws.cell(r, 1).value
+        if isinstance(v, str) and v.strip():
+            labels.append((r, v.strip().lower()))
+
+    def find_after(text, after_row=0):
+        for r, v in labels:
+            if r > after_row and text in v:
+                return r
+        return None
+
+    dow_row            = find_after("day of week")
+    otb_rooms_row      = find_after("rooms sold")
+    adr_otb_row        = find_after("adr otb")
+    actual_rooms_row   = find_after("rooms sold", adr_otb_row) if adr_otb_row else None
+    actual_revenue_row = find_after("revenue", actual_rooms_row) if actual_rooms_row else None
+
+    if not all([dow_row, otb_rooms_row, adr_otb_row, actual_rooms_row, actual_revenue_row]):
+        return None
+
+    return {
+        "as_of_row":          dow_row - 1,
+        "date_row":           dow_row + 1,
+        "otb_rooms_row":      otb_rooms_row,
+        "adr_otb_row":        adr_otb_row,
+        "actual_rooms_row":   actual_rooms_row,
+        "actual_revenue_row": actual_revenue_row,
+    }
+
+
+def build_forecast_date_col_map(ws, wb=None, date_row=4):
+    """Return {date: col_index} from date_row. Falls back to WK1 for formula-only sheets."""
+    month_start = parse_any_date(ws.cell(date_row, 2).value)
 
     # If this sheet's col B is a formula, find the start date from any WK sheet with a literal
     if month_start is None and wb is not None:
         for sname in wb.sheetnames:
             if "glance" in sname.lower():
                 continue
-            candidate = parse_any_date(wb[sname].cell(4, 2).value)
+            candidate = parse_any_date(wb[sname].cell(date_row, 2).value)
             if candidate is not None:
                 month_start = candidate
                 break
@@ -871,7 +962,7 @@ def build_forecast_date_col_map(ws, wb=None):
     col_map = {}
     col = 2
     while col <= ws.max_column:
-        cell = ws.cell(4, col)
+        cell = ws.cell(date_row, col)
         if isinstance(cell.value, str) and "total" in cell.value.lower():
             break
         if cell.value is None and col > 2:
@@ -1029,17 +1120,21 @@ def build_forecast_change_plan(df, ws, rob_wb=None, is_wk1=False):
     yesterday = today - datetime.timedelta(days=1)
     month_start = today.replace(day=1)
 
-    col_map = build_forecast_date_col_map(ws, ws.parent)
+    rows = locate_forecast_rows(ws)
+    if not rows:
+        return [], ["Could not read row titles (As-of date / Rooms Sold / ADR OTB / Revenue) from forecast sheet."]
+
+    col_map = build_forecast_date_col_map(ws, ws.parent, date_row=rows["date_row"])
     if not col_map:
         return [], ["Could not read date row from forecast sheet."]
 
     changes = []
     warnings = []
 
-    # A2 = today's date
+    # As-of date (row directly above "Day of Week")
     changes.append({
-        "label": "As-of date", "row": 2, "col": 1,
-        "new_value": today, "skip_reason": "formula" if is_formula(ws.cell(2, 1).value) else None,
+        "label": "As-of date", "row": rows["as_of_row"], "col": 1,
+        "new_value": today, "skip_reason": "formula" if is_formula(ws.cell(rows["as_of_row"], 1).value) else None,
     })
 
     # Build lookup from CSV: date -> row dict
@@ -1065,24 +1160,24 @@ def build_forecast_change_plan(df, ws, rob_wb=None, is_wk1=False):
         is_future = d >= today
         is_past   = d <= yesterday and d >= month_start
 
-        # Row 6: Rooms Sold (future)
+        # Rooms Sold (future / OTB)
         if is_future:
-            skip = "formula" if is_formula(ws.cell(6, col).value) else None
-            changes.append({"label": f"Rooms Sold (future) {d}", "row": 6, "col": col,
+            skip = "formula" if is_formula(ws.cell(rows["otb_rooms_row"], col).value) else None
+            changes.append({"label": f"Rooms Sold (future) {d}", "row": rows["otb_rooms_row"], "col": col,
                             "new_value": rms, "skip_reason": skip})
-            # Row 14: ADR OTB (future)
-            skip = "formula" if is_formula(ws.cell(14, col).value) else None
-            changes.append({"label": f"ADR OTB {d}", "row": 14, "col": col,
+            # ADR OTB (future)
+            skip = "formula" if is_formula(ws.cell(rows["adr_otb_row"], col).value) else None
+            changes.append({"label": f"ADR OTB {d}", "row": rows["adr_otb_row"], "col": col,
                             "new_value": adr, "skip_reason": skip})
 
-        # Row 16: Rooms Sold (actuals)
+        # Rooms Sold (actuals)
         if is_past:
-            skip = "formula" if is_formula(ws.cell(16, col).value) else None
-            changes.append({"label": f"Rooms Sold (actual) {d}", "row": 16, "col": col,
+            skip = "formula" if is_formula(ws.cell(rows["actual_rooms_row"], col).value) else None
+            changes.append({"label": f"Rooms Sold (actual) {d}", "row": rows["actual_rooms_row"], "col": col,
                             "new_value": rms, "skip_reason": skip})
-            # Row 19: Revenue (actuals)
-            skip = "formula" if is_formula(ws.cell(19, col).value) else None
-            changes.append({"label": f"Revenue (actual) {d}", "row": 19, "col": col,
+            # Revenue (actuals)
+            skip = "formula" if is_formula(ws.cell(rows["actual_revenue_row"], col).value) else None
+            changes.append({"label": f"Revenue (actual) {d}", "row": rows["actual_revenue_row"], "col": col,
                             "new_value": rev, "skip_reason": skip})
 
     # Pick-up tracking row: write full month rooms sold to next available row
@@ -1128,25 +1223,29 @@ def build_forecast_change_plan(df, ws, rob_wb=None, is_wk1=False):
 
 
 def build_next_month_forecast_plan(df, ws):
-    """For weeks 3 & 4: write Rooms Sold (row 6) and ADR OTB (row 14) for ALL
-    dates in the next month (everything in the CSV beyond the current month).
-    Also writes A2 = today and the pick-up tracking row.
+    """For weeks 3 & 4: write Rooms Sold and ADR OTB (rows located by title,
+    not a fixed offset) for ALL dates in the next month (everything in the CSV
+    beyond the current month). Also writes the As-of date and pick-up tracking row.
     """
     today = datetime.date.today()
     current_month_end = (today.replace(day=1) + datetime.timedelta(days=32)).replace(day=1) - datetime.timedelta(days=1)
 
-    col_map = build_forecast_date_col_map(ws, ws.parent)
+    rows = locate_forecast_rows(ws)
+    if not rows:
+        return [], ["Could not read row titles (As-of date / Rooms Sold / ADR OTB / Revenue) from next-month forecast sheet."]
+
+    col_map = build_forecast_date_col_map(ws, ws.parent, date_row=rows["date_row"])
     if not col_map:
         return [], ["Could not read date row from next-month forecast sheet."]
 
     changes = []
     warnings = []
 
-    # A2 = today's date
+    # As-of date (row directly above "Day of Week")
     changes.append({
-        "label": "As-of date", "row": 2, "col": 1,
+        "label": "As-of date", "row": rows["as_of_row"], "col": 1,
         "new_value": today,
-        "skip_reason": "formula" if is_formula(ws.cell(2, 1).value) else None,
+        "skip_reason": "formula" if is_formula(ws.cell(rows["as_of_row"], 1).value) else None,
     })
 
     daily_rows = {}
@@ -1167,10 +1266,10 @@ def build_next_month_forecast_plan(df, ws):
         rms = safe_float(csv_row.iloc[1])
         adr = safe_float(csv_row.iloc[6])
 
-        skip6  = "formula" if is_formula(ws.cell(6, col).value) else None
-        skip14 = "formula" if is_formula(ws.cell(14, col).value) else None
-        changes.append({"label": f"Rooms Sold (future) {d}", "row": 6,  "col": col, "new_value": rms, "skip_reason": skip6})
-        changes.append({"label": f"ADR OTB {d}",             "row": 14, "col": col, "new_value": adr, "skip_reason": skip14})
+        skip_rms = "formula" if is_formula(ws.cell(rows["otb_rooms_row"], col).value) else None
+        skip_adr = "formula" if is_formula(ws.cell(rows["adr_otb_row"], col).value) else None
+        changes.append({"label": f"Rooms Sold (future) {d}", "row": rows["otb_rooms_row"], "col": col, "new_value": rms, "skip_reason": skip_rms})
+        changes.append({"label": f"ADR OTB {d}",             "row": rows["adr_otb_row"],   "col": col, "new_value": adr, "skip_reason": skip_adr})
 
     # Pick-up tracking row (same logic — full month of next month dates)
     target_row = find_next_pickup_data_row(ws)
@@ -2385,10 +2484,21 @@ if test_mode:
             wb_fcst_peek = openpyxl.load_workbook(io.BytesIO(fcst_bytes), data_only=False)
     
             avail_fcst = [s for s in FORECAST_SHEETS if s in wb_fcst_peek.sheetnames]
-            auto_fcst  = first_uncolored_sheet(wb_fcst_peek, avail_fcst) if avail_fcst else None
-            fcst_sheet = st.selectbox("Week tab", avail_fcst,
-                                      index=avail_fcst.index(auto_fcst) if auto_fcst else 0,
-                                      key="fcst_sheet")
+            auto_fcst  = first_unhighlighted_forecast_sheet(wb_fcst_peek, avail_fcst) if avail_fcst else None
+
+            # A selectbox's `index=` is only honored the first time its `key` is
+            # created — once fcst_sheet exists in session_state, Streamlit ignores
+            # index= on every rerun and keeps the old selection. Re-uploading a new
+            # file (this week's, with more tabs now done) would silently keep
+            # writing to whatever tab was last picked instead of the newly
+            # auto-detected one. Force a reset whenever the uploaded bytes change.
+            fcst_hash = hashlib.md5(fcst_bytes).hexdigest()
+            if st.session_state.get("fcst_xl_hash") != fcst_hash:
+                st.session_state["fcst_xl_hash"] = fcst_hash
+                if auto_fcst:
+                    st.session_state["fcst_sheet"] = auto_fcst
+
+            fcst_sheet = st.selectbox("Week tab", avail_fcst, key="fcst_sheet")
             if auto_fcst:
                 st.caption(f"Auto-detected next tab: **{auto_fcst}**")
     
@@ -2396,10 +2506,15 @@ if test_mode:
                 fcst_next_bytes = fcst_xl_next.read()
                 wb_next_peek    = openpyxl.load_workbook(io.BytesIO(fcst_next_bytes), data_only=False)
                 avail_next      = [s for s in FORECAST_SHEETS if s in wb_next_peek.sheetnames]
-                auto_next       = first_uncolored_sheet(wb_next_peek, avail_next) if avail_next else None
-                fcst_sheet_next = st.selectbox("Next month week tab", avail_next,
-                                               index=avail_next.index(auto_next) if auto_next else 0,
-                                               key="fcst_sheet_next")
+                auto_next       = first_unhighlighted_forecast_sheet(wb_next_peek, avail_next) if avail_next else None
+
+                fcst_next_hash = hashlib.md5(fcst_next_bytes).hexdigest()
+                if st.session_state.get("fcst_xl_next_hash") != fcst_next_hash:
+                    st.session_state["fcst_xl_next_hash"] = fcst_next_hash
+                    if auto_next:
+                        st.session_state["fcst_sheet_next"] = auto_next
+
+                fcst_sheet_next = st.selectbox("Next month week tab", avail_next, key="fcst_sheet_next")
                 if auto_next:
                     st.caption(f"Auto-detected next month tab: **{auto_next}**")
     
@@ -2771,7 +2886,7 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
                 warnings += rate_warnings
         else:  # Forecast — current month (no Month Ending Forecast fill here)
             avail    = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
-            auto     = first_uncolored_sheet(wb, avail)
+            auto     = first_unhighlighted_forecast_sheet(wb, avail)
             sheet    = auto or avail[0]
             changes, warnings = build_forecast_change_plan(df, wb[sheet])
         all_plans[wb_type] = {
@@ -2806,7 +2921,7 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
             nm_bytes = drive_download(svc, nm_file_id)
             nm_wb    = openpyxl.load_workbook(io.BytesIO(nm_bytes), data_only=False)
             nm_avail = [s for s in FORECAST_SHEETS if s in nm_wb.sheetnames]
-            nm_auto  = first_uncolored_sheet(nm_wb, nm_avail)
+            nm_auto  = first_unhighlighted_forecast_sheet(nm_wb, nm_avail)
             nm_sheet = nm_auto or nm_avail[0]
             nm_changes, nm_warnings = build_next_month_forecast_plan(df, nm_wb[nm_sheet])
             # Month Ending Forecast table — fill Budget + LY from next month's ROB
