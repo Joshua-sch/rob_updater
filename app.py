@@ -2636,9 +2636,13 @@ if LOGIN_ENABLED and not st.session_state["authenticated"]:
             display_name     = st.text_input("Your name", key="access_key_display_name")
             key_submitted     = st.form_submit_button("Enter")
             if key_submitted:
-                if not access_key_input:
+                configured_key = st.secrets.get("auth", {}).get("access_key")
+                if not configured_key:
+                    st.error("Access key login isn't set up yet — an admin needs to add "
+                             "'access_key' under [auth] in this app's secrets.")
+                elif not access_key_input:
                     st.error("Access key is required.")
-                elif access_key_input.strip() != st.secrets["auth"]["access_key"]:
+                elif access_key_input.strip() != configured_key:
                     st.error("Incorrect access key.")
                 else:
                     st.session_state["authenticated"] = True
