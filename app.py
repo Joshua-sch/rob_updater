@@ -1380,17 +1380,24 @@ MULTI_ID_PREFIX = "MULTI:"
 
 
 def _extract_hotel_name_from_rev_folder(name):
-    """Strip a leading year ('2026 ...'), a leading letter+month+year prefix
-    ('A. JAN2026 ...'), and the phrase 'Revenue Reports' from a folder name,
-    leaving just the hotel name. Used to group several per-year REVENUE
-    REPORTS folders (confirmed real pattern: Hyannis Anchor In has a separate
-    folder per year, e.g. '2021 Revenue Reports Hyannis Anchor In', '2026
-    Revenue Reports Hyannis Anchor In', 'A. JAN2026 Revenue Reports Hyannis
-    Anchor In') into one hotel entry instead of showing each one separately.
+    """Strip date-ish prefixes and the phrase 'Revenue Reports' from a folder
+    name, leaving just the hotel name. Confirmed real naming is inconsistent
+    even for a single hotel (Hyannis Anchor In, sharing per-month/year folders
+    since there's no common parent to share instead): 'A: APR2025 Revenue
+    Reports Anchor In', 'A: JUN2025 Revenue Reports Hyannis Anchor In',
+    'Jul2024 Revenue Reports Hyannis Anchor In', 'A: MAY25 Revenue Reports
+    Hyannis Anchor In' — mixing a leading single-letter marker (with a colon,
+    period, or dash — not just a period), 2- or 4-digit years, and even
+    inconsistent inclusion of "Hyannis" in the hotel name itself.
+
+    Only strips a leading single letter when followed by a clear separator
+    (":", ".", "-") — a bare leading letter with no separator is the start of
+    a month name (e.g. "Jul2024") and must be left alone, not eaten.
     """
-    s = re.sub(r'^[A-Za-z]\.?\s*', '', name.strip())
+    s = name.strip()
+    s = re.sub(r'^[A-Za-z]\s*[\.\:\-]\s*', '', s)
+    s = re.sub(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*\d{2,4}\s+', '', s, flags=re.IGNORECASE)
     s = re.sub(r'^\d{4}\s+', '', s)
-    s = re.sub(r'^[A-Za-z]{3}\d{4}\s+', '', s, flags=re.IGNORECASE)
     s = re.sub(r'revenue\s*reports', '', s, flags=re.IGNORECASE)
     return re.sub(r'\s+', ' ', s).strip()
 
@@ -1422,14 +1429,25 @@ def get_hotels_from_drive():
         folders = result.get("files", [])
 
         hotels = []
-        rev_groups = {}  # normalized hotel name -> {"display": str, "ids": [folder_id, ...]}
+        rev_groups = []  # list of {"display": str, "ids": [folder_id, ...]}
         for folder in folders:
             name = folder["name"]
             if "REVENUE REPORTS" in name.upper():
-                hotel_name = _extract_hotel_name_from_rev_folder(name) or name
-                key = hotel_name.lower()
-                rev_groups.setdefault(key, {"display": hotel_name, "ids": []})
-                rev_groups[key]["ids"].append(folder["id"])
+                extracted = _extract_hotel_name_from_rev_folder(name) or name
+                norm = extracted.upper()
+                # Merge by substring containment, not exact match — the same
+                # hotel's own folders don't always spell its name the same way
+                # (confirmed real case: some of Hyannis Anchor In's folders
+                # say just "Anchor In", others "Hyannis Anchor In"). Keep the
+                # longest/most complete variant seen as the display name.
+                match = next((g for g in rev_groups
+                              if norm in g["display"].upper() or g["display"].upper() in norm), None)
+                if match:
+                    match["ids"].append(folder["id"])
+                    if len(extracted) > len(match["display"]):
+                        match["display"] = extracted
+                else:
+                    rev_groups.append({"display": extracted, "ids": [folder["id"]]})
                 continue
             if re.search(r'\b20\d{2}\b', name):
                 continue
@@ -1443,7 +1461,7 @@ def get_hotels_from_drive():
             if has_rev:
                 hotels.append((name, folder["id"]))
 
-        for info in rev_groups.values():
+        for info in rev_groups:
             if len(info["ids"]) == 1:
                 hotels.append((info["display"], info["ids"][0]))
             else:
@@ -2315,8 +2333,11 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
             return None, f"Could not read any of the shared year folders for '{hotel_name}'."
 
         # A month-named folder (e.g. "A. JAN2026 Revenue Reports ...") likely
-        # holds the files directly — try that first.
-        month_match = next((f for f in candidates if month_kw in f["name"].upper()), None)
+        # holds the files directly — try that first. Also accept a 2-digit
+        # year variant (e.g. "MAY25" for May 2025 — confirmed real naming).
+        month_kw_2digit = month_date.strftime("%b%y").upper()
+        month_match = next((f for f in candidates
+                            if month_kw in f["name"].upper() or month_kw_2digit in f["name"].upper()), None)
         if month_match:
             result = _find_file_in(month_match["id"], month_match["name"])
             if result[0]:
