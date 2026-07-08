@@ -1388,8 +1388,18 @@ MULTI_ID_PREFIX = "MULTI:"
 # guaranteed present in every one of that hotel's folder names is far more
 # reliable. Add an entry here for each hotel using this sharing pattern.
 KNOWN_MULTI_FOLDER_HOTELS = {
-    "Hyannis Anchor In": ["ANCHOR"],
+    "Hyannis Anchor In":     ["ANCHOR"],
+    "Provincetown Surfside": ["SURFSIDE"],
 }
+
+
+def _strip_dedup_suffix(name):
+    """Strip a trailing ' (1)', ' (2)', etc. — Drive's auto-added suffix when
+    a folder name collides with an existing one (confirmed real case:
+    Surfside's hotel folder is literally named 'SURFSIDE (1)' in Drive).
+    Purely cosmetic for the dropdown; the real folder_id is unaffected.
+    """
+    return re.sub(r'\s*\(\d+\)\s*$', '', name).strip()
 
 
 def _extract_hotel_name_from_rev_folder(name):
@@ -1448,6 +1458,14 @@ def get_hotels_from_drive():
             name = folder["name"]
             name_upper = name.upper()
 
+            # "Ancillary" folders are a different report category entirely
+            # (ancillary revenue / front desk reports, not the ROB/SR/Forecast
+            # per-month structure) — confirmed real case: "Ancillary
+            # Provincetown Surfside" showing up as its own bogus hotel entry.
+            # Exclude from grouping regardless of which hotel keyword matches.
+            if "ANCILLARY" in name_upper:
+                continue
+
             known_match = next((hn for hn, kws in KNOWN_MULTI_FOLDER_HOTELS.items()
                                  if any(kw in name_upper for kw in kws)), None)
             if known_match:
@@ -1455,7 +1473,14 @@ def get_hotels_from_drive():
                 continue
 
             if "REVENUE REPORTS" in name_upper:
-                extracted = _extract_hotel_name_from_rev_folder(name) or name
+                extracted = _extract_hotel_name_from_rev_folder(name)
+                if not extracted:
+                    # No hotel name left after stripping the date prefix and
+                    # "Revenue Reports" — an orphaned/mis-named folder with no
+                    # usable hotel name (confirmed real case: "I. SEPT2021
+                    # Revenue Reports", missing the hotel name entirely).
+                    # Skip it rather than showing a meaningless entry.
+                    continue
                 norm = extracted.upper()
                 # Merge by substring containment, not exact match — the same
                 # hotel's own folders don't always spell its name the same way
@@ -1481,16 +1506,17 @@ def get_hotels_from_drive():
             ).execute()
             has_rev = any("REVENUE REPORTS" in c["name"].upper() for c in children.get("files", []))
             if has_rev:
-                hotels.append((name, folder["id"]))
+                hotels.append((_strip_dedup_suffix(name), folder["id"]))
 
         for hotel_name, ids in known_groups.items():
-            hotels.append((hotel_name, ids[0] if len(ids) == 1 else MULTI_ID_PREFIX + ",".join(ids)))
+            hotels.append((_strip_dedup_suffix(hotel_name), ids[0] if len(ids) == 1 else MULTI_ID_PREFIX + ",".join(ids)))
 
         for info in rev_groups:
+            display = _strip_dedup_suffix(info["display"])
             if len(info["ids"]) == 1:
-                hotels.append((info["display"], info["ids"][0]))
+                hotels.append((display, info["ids"][0]))
             else:
-                hotels.append((info["display"], MULTI_ID_PREFIX + ",".join(info["ids"])))
+                hotels.append((display, MULTI_ID_PREFIX + ",".join(info["ids"])))
 
         return sorted(hotels, key=lambda x: x[0])
     except Exception:
@@ -2322,13 +2348,24 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
       B) Hotel > REVENUE REPORTS > Year > Month > files (nested year/month subfolders)
     Returns ((file_id, file_name), None) or (None, error_message).
     Never touches files whose name contains 'master'.
+
+    A "hotel" can also be a MULTI:<id>,<id>,... group — several candidate
+    root folders sharing one dropdown entry, either because they're each a
+    flat per-year/month folder shared directly (Hyannis Anchor In) or full
+    duplicate top-level hotel folders from historical typos/copies
+    (confirmed real case: "Provinceetown Surfside", "Provincertown
+    Surfside", "Surfside (1)" all being the same hotel). Each candidate is
+    resolved fully (structures A/B/C, recursing into its own REVENUE REPORTS
+    child if it has one) rather than guessed from its name alone — whichever
+    candidate actually contains the target file wins.
     """
     if month_date is None:
         month_date = datetime.date.today()
 
-    month_kw   = month_date.strftime("%b%Y").upper()
-    year_kw    = str(month_date.year)
-    wb_keyword = WORKBOOK_KEYWORDS[workbook_type]
+    month_kw        = month_date.strftime("%b%Y").upper()
+    month_kw_2digit = month_date.strftime("%b%y").upper()
+    year_kw         = str(month_date.year)
+    wb_keyword      = WORKBOOK_KEYWORDS[workbook_type]
 
     def _list_subfolders(parent_id):
         q = (f"'{parent_id}' in parents and trashed = false and "
@@ -2346,10 +2383,62 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
             return None, f"Resolved file '{fname}' looks like a master doc — aborting."
         return (fid, fname), None
 
-    # Hotel has a separate REVENUE REPORTS folder shared per year (each
-    # individually shared, since there's no common parent to share instead —
-    # confirmed real case: Hyannis Anchor In). Pick the one for the target
-    # month/year, then fall through to the normal single-folder logic below.
+    def _resolve_single(single_id, single_name):
+        """Resolve within ONE candidate root — either a full hotel-parent
+        folder (with its own REVENUE REPORTS > year > month nesting) or a
+        folder that IS already the REVENUE REPORTS level directly (detected
+        from its own name). Returns ((file_id, file_name), None) or (None, err).
+        """
+        self_is_rev = "REVENUE REPORTS" in single_name.upper()
+        children = _list_subfolders(single_id)
+
+        # A: Hotel > MMMYYYY REVENUE REPORTS HOTEL > file
+        if not self_is_rev:
+            a = next((f for f in children
+                       if "REVENUE REPORTS" in f["name"].upper() and month_kw in f["name"].upper()), None)
+            if a:
+                result = _find_file_in(a["id"], a["name"])
+                if result[0]:
+                    return result
+
+        # B: Hotel > REVENUE REPORTS > MMMYYYY ... > file
+        if self_is_rev:
+            rev = {"id": single_id, "name": single_name}
+        else:
+            rev = next((f for f in children
+                        if "REVENUE REPORTS" in f["name"].upper() and year_kw in f["name"]), None)
+            if not rev:
+                rev = next((f for f in children if "REVENUE REPORTS" in f["name"].upper()), None)
+        if rev:
+            rev_children = children if self_is_rev else _list_subfolders(rev["id"])
+            b1 = next((f for f in rev_children if month_kw in f["name"].upper()), None)
+            if b1:
+                result = _find_file_in(b1["id"], b1["name"])
+                if result[0]:
+                    return result
+            b2_year = next((f for f in rev_children if year_kw in f["name"].upper()), None)
+            if b2_year:
+                b2_month_id, b2_month_name = drive_find_folder_by_keyword(
+                    service, month_kw, parent_id=b2_year["id"])
+                if b2_month_id:
+                    result = _find_file_in(b2_month_id, b2_month_name)
+                    if result[0]:
+                        return result
+
+        # C: Hotel > Year > Month > file  (no REVENUE REPORTS wrapper)
+        c_year = next((f for f in children
+                       if year_kw in f["name"].upper()
+                       and "REVENUE REPORTS" not in f["name"].upper()), None)
+        if c_year:
+            c_month_id, c_month_name = drive_find_folder_by_keyword(
+                service, month_kw, parent_id=c_year["id"])
+            if c_month_id:
+                result = _find_file_in(c_month_id, c_month_name)
+                if result[0]:
+                    return result
+
+        return None, f"Could not find '{month_kw}' workbook under '{single_name}'."
+
     if hotel_id.startswith(MULTI_ID_PREFIX):
         candidate_ids = hotel_id[len(MULTI_ID_PREFIX):].split(",")
         candidates = []
@@ -2360,82 +2449,30 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
             except Exception:
                 continue
         if not candidates:
-            return None, f"Could not read any of the shared year folders for '{hotel_name}'."
+            return None, f"Could not read any of the shared folders for '{hotel_name}'."
 
-        # A month-named folder (e.g. "A. JAN2026 Revenue Reports ...") likely
-        # holds the files directly — try that first. Also accept a 2-digit
-        # year variant (e.g. "MAY25" for May 2025 — confirmed real naming).
-        month_kw_2digit = month_date.strftime("%b%y").upper()
-        month_match = next((f for f in candidates
-                            if month_kw in f["name"].upper() or month_kw_2digit in f["name"].upper()), None)
-        if month_match:
-            result = _find_file_in(month_match["id"], month_match["name"])
-            if result[0]:
-                return result
+        # Try the most likely-named candidates first (pure ordering
+        # optimization), but fall through to the next candidate if one
+        # doesn't actually contain the file — e.g. a stale duplicate folder
+        # from a typo — instead of giving up after the first name match.
+        def _sort_key(f):
+            name_up = f["name"].upper()
+            if month_kw in name_up or month_kw_2digit in name_up:
+                return 0
+            if year_kw in name_up:
+                return 1
+            return 2
+        ordered = sorted(candidates, key=_sort_key)
 
-        # Otherwise use the year-named folder (e.g. "2026 Revenue Reports
-        # ...") and search inside it, same as a single hotel's own REVENUE
-        # REPORTS folder is searched below.
-        year_match = next((f for f in candidates if year_kw in f["name"]), None)
-        match = year_match or month_match or candidates[0]
-        hotel_id, hotel_name = match["id"], match["name"]
+        last_err = None
+        for cand in ordered:
+            result, err = _resolve_single(cand["id"], cand["name"])
+            if result:
+                return result, None
+            last_err = err
+        return None, last_err or f"Could not find '{month_kw}' workbook for '{hotel_name}'."
 
-    # Some hotels are shared with the service account directly at the
-    # REVENUE REPORTS folder level (Shared Drive permissions don't propagate
-    # to a parent folder, so if only that folder was shared, hotel_id IS it —
-    # there's no separate parent to search). Detect this from hotel_name
-    # (get_hotels_from_drive surfaces such a folder using its own name,
-    # which contains "REVENUE REPORTS") and skip straight to structure B
-    # using hotel_id's own children as the rev-reports children.
-    self_is_rev = "REVENUE REPORTS" in hotel_name.upper()
-
-    hotel_children = _list_subfolders(hotel_id)
-
-    # A: Hotel > MMMYYYY REVENUE REPORTS HOTEL > file
-    a = None
-    if not self_is_rev:
-        a = next((f for f in hotel_children
-                   if "REVENUE REPORTS" in f["name"].upper() and month_kw in f["name"].upper()), None)
-    if a:
-        return _find_file_in(a["id"], a["name"])
-
-    # B: Hotel > REVENUE REPORTS > MMMYYYY ... > file  (month folder inside rev-reports)
-    if self_is_rev:
-        rev = {"id": hotel_id, "name": hotel_name}
-    else:
-        # Prefer the revenue reports folder that also matches the target year
-        rev = next((f for f in hotel_children
-                    if "REVENUE REPORTS" in f["name"].upper() and year_kw in f["name"]), None)
-        if not rev:
-            rev = next((f for f in hotel_children if "REVENUE REPORTS" in f["name"].upper()), None)
-    if rev:
-        rev_children = hotel_children if self_is_rev else _list_subfolders(rev["id"])
-        # B1: month folder directly inside REVENUE REPORTS
-        b1 = next((f for f in rev_children if month_kw in f["name"].upper()), None)
-        if b1:
-            return _find_file_in(b1["id"], b1["name"])
-        # B2: year subfolder → month subfolder
-        b2_year = next((f for f in rev_children
-                        if year_kw in f["name"].upper()), None)
-        if b2_year:
-            b2_month_id, b2_month_name = drive_find_folder_by_keyword(
-                service, month_kw, parent_id=b2_year["id"])
-            if b2_month_id:
-                return _find_file_in(b2_month_id, b2_month_name)
-
-    # C: Hotel > Year > Month > file  (no REVENUE REPORTS wrapper)
-    c_year = next((f for f in hotel_children
-                   if year_kw in f["name"].upper()
-                   and "REVENUE REPORTS" not in f["name"].upper()), None)
-    if c_year:
-        c_month_id, c_month_name = drive_find_folder_by_keyword(
-            service, month_kw, parent_id=c_year["id"])
-        if c_month_id:
-            return _find_file_in(c_month_id, c_month_name)
-
-    return None, (f"Could not find '{month_kw}' workbook for '{hotel_name}'. "
-                  f"Checked: top-level month folder, REVENUE REPORTS subfolders, "
-                  f"and Year > Month subfolders.")
+    return _resolve_single(hotel_id, hotel_name)
 
 
 DOW_ABBREVS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
