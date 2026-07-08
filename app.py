@@ -1376,6 +1376,25 @@ def apply_forecast_changes(wb, sheet_name, changes):
 
 # ── Google Drive ──────────────────────────────────────────────────────────────
 
+MULTI_ID_PREFIX = "MULTI:"
+
+
+def _extract_hotel_name_from_rev_folder(name):
+    """Strip a leading year ('2026 ...'), a leading letter+month+year prefix
+    ('A. JAN2026 ...'), and the phrase 'Revenue Reports' from a folder name,
+    leaving just the hotel name. Used to group several per-year REVENUE
+    REPORTS folders (confirmed real pattern: Hyannis Anchor In has a separate
+    folder per year, e.g. '2021 Revenue Reports Hyannis Anchor In', '2026
+    Revenue Reports Hyannis Anchor In', 'A. JAN2026 Revenue Reports Hyannis
+    Anchor In') into one hotel entry instead of showing each one separately.
+    """
+    s = re.sub(r'^[A-Za-z]\.?\s*', '', name.strip())
+    s = re.sub(r'^\d{4}\s+', '', s)
+    s = re.sub(r'^[A-Za-z]{3}\d{4}\s+', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'revenue\s*reports', '', s, flags=re.IGNORECASE)
+    return re.sub(r'\s+', ' ', s).strip()
+
+
 @st.cache_data(ttl=300)
 def get_hotels_from_drive():
     """Return list of (display_name, folder_id) for every top-level folder
@@ -1383,12 +1402,15 @@ def get_hotels_from_drive():
     Cached for 5 minutes so it doesn't hit Drive on every rerender.
 
     Some hotels are shared with the service account directly at the REVENUE
-    REPORTS folder itself, not its parent — this happens on Shared Drives
+    REPORTS folder level, not its parent — this happens on Shared Drives
     where the person granting access can only share folders they themselves
     have permission on, and Drive permissions don't propagate upward to a
-    parent. In that case the service account can't see any parent folder at
-    all, so a REVENUE-REPORTS-named top-level folder is treated as the hotel
-    entry directly instead of being skipped.
+    parent. Some of those hotels additionally have a SEPARATE REVENUE
+    REPORTS folder per year (confirmed real case: Hyannis Anchor In), each
+    shared individually since there's no common parent to share instead —
+    those get grouped into a single hotel entry by name, with folder_id set
+    to 'MULTI:<id>,<id>,...' listing every year's folder. resolve_drive_workbook
+    and _find_rev_reports_folder_for_year both know how to unpack this.
     """
     try:
         svc = get_drive_service()
@@ -1400,10 +1422,14 @@ def get_hotels_from_drive():
         folders = result.get("files", [])
 
         hotels = []
+        rev_groups = {}  # normalized hotel name -> {"display": str, "ids": [folder_id, ...]}
         for folder in folders:
             name = folder["name"]
             if "REVENUE REPORTS" in name.upper():
-                hotels.append((name, folder["id"]))
+                hotel_name = _extract_hotel_name_from_rev_folder(name) or name
+                key = hotel_name.lower()
+                rev_groups.setdefault(key, {"display": hotel_name, "ids": []})
+                rev_groups[key]["ids"].append(folder["id"])
                 continue
             if re.search(r'\b20\d{2}\b', name):
                 continue
@@ -1416,6 +1442,12 @@ def get_hotels_from_drive():
             has_rev = any("REVENUE REPORTS" in c["name"].upper() for c in children.get("files", []))
             if has_rev:
                 hotels.append((name, folder["id"]))
+
+        for info in rev_groups.values():
+            if len(info["ids"]) == 1:
+                hotels.append((info["display"], info["ids"][0]))
+            else:
+                hotels.append((info["display"], MULTI_ID_PREFIX + ",".join(info["ids"])))
 
         return sorted(hotels, key=lambda x: x[0])
     except Exception:
@@ -1472,6 +1504,25 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw):
     for hotels using the per-year pattern. Prefer an exact year-name match;
     fall back to the first REVENUE REPORTS folder found.
     """
+    # Hotel has a separate REVENUE REPORTS folder shared per year (each
+    # individually shared, since there's no common parent to share instead).
+    # Pick the one matching year_kw directly from the group.
+    if hotel_id.startswith(MULTI_ID_PREFIX):
+        candidate_ids = hotel_id[len(MULTI_ID_PREFIX):].split(",")
+        candidates = []
+        for cid in candidate_ids:
+            try:
+                info = service.files().get(fileId=cid, fields="name", supportsAllDrives=True).execute()
+                candidates.append({"id": cid, "name": info["name"]})
+            except Exception:
+                continue
+        year_match = next((f for f in candidates if year_kw in f["name"]), None)
+        if year_match:
+            return year_match["id"], year_match["name"]
+        if candidates:
+            return candidates[0]["id"], candidates[0]["name"]
+        return None, None
+
     q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
          "and '%s' in parents") % hotel_id
     children = service.files().list(
@@ -2246,6 +2297,37 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
         if "master" in fname.lower():
             return None, f"Resolved file '{fname}' looks like a master doc — aborting."
         return (fid, fname), None
+
+    # Hotel has a separate REVENUE REPORTS folder shared per year (each
+    # individually shared, since there's no common parent to share instead —
+    # confirmed real case: Hyannis Anchor In). Pick the one for the target
+    # month/year, then fall through to the normal single-folder logic below.
+    if hotel_id.startswith(MULTI_ID_PREFIX):
+        candidate_ids = hotel_id[len(MULTI_ID_PREFIX):].split(",")
+        candidates = []
+        for cid in candidate_ids:
+            try:
+                info = service.files().get(fileId=cid, fields="name", supportsAllDrives=True).execute()
+                candidates.append({"id": cid, "name": info["name"]})
+            except Exception:
+                continue
+        if not candidates:
+            return None, f"Could not read any of the shared year folders for '{hotel_name}'."
+
+        # A month-named folder (e.g. "A. JAN2026 Revenue Reports ...") likely
+        # holds the files directly — try that first.
+        month_match = next((f for f in candidates if month_kw in f["name"].upper()), None)
+        if month_match:
+            result = _find_file_in(month_match["id"], month_match["name"])
+            if result[0]:
+                return result
+
+        # Otherwise use the year-named folder (e.g. "2026 Revenue Reports
+        # ...") and search inside it, same as a single hotel's own REVENUE
+        # REPORTS folder is searched below.
+        year_match = next((f for f in candidates if year_kw in f["name"]), None)
+        match = year_match or month_match or candidates[0]
+        hotel_id, hotel_name = match["id"], match["name"]
 
     # Some hotels are shared with the service account directly at the
     # REVENUE REPORTS folder level (Shared Drive permissions don't propagate
