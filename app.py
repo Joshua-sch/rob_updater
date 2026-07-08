@@ -2642,6 +2642,7 @@ with profile_col:
             st.rerun()
 
 if st.session_state.get("view") == "admin_settings" and st.session_state.get("is_admin"):
+    _admin_svc = None
     try:
         _admin_svc = get_drive_service()
         _users_file_id, _users_err = _find_or_create_users_file(_admin_svc)
