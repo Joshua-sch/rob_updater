@@ -1378,6 +1378,18 @@ def apply_forecast_changes(wb, sheet_name, changes):
 
 MULTI_ID_PREFIX = "MULTI:"
 
+# Hotels whose Drive folders had to be shared per-month/year directly (no
+# common parent folder to share instead) get grouped by a known keyword
+# instead of trying to generically parse the date prefix out of the folder
+# name — that parsing kept breaking on real naming inconsistencies (mixed
+# case, 2- vs 4-digit years, colon/period/no separator, even "Anchor In" vs
+# "Hyannis Anchor In" for the same hotel). Matching on a fixed keyword that's
+# guaranteed present in every one of that hotel's folder names is far more
+# reliable. Add an entry here for each hotel using this sharing pattern.
+KNOWN_MULTI_FOLDER_HOTELS = {
+    "Hyannis Anchor In": ["ANCHOR"],
+}
+
 
 def _extract_hotel_name_from_rev_folder(name):
     """Strip date-ish prefixes and the phrase 'Revenue Reports' from a folder
@@ -1429,10 +1441,19 @@ def get_hotels_from_drive():
         folders = result.get("files", [])
 
         hotels = []
-        rev_groups = []  # list of {"display": str, "ids": [folder_id, ...]}
+        known_groups = {}  # hotel display name -> [folder_id, ...]
+        rev_groups = []     # list of {"display": str, "ids": [folder_id, ...]} for unregistered hotels
         for folder in folders:
             name = folder["name"]
-            if "REVENUE REPORTS" in name.upper():
+            name_upper = name.upper()
+
+            known_match = next((hn for hn, kws in KNOWN_MULTI_FOLDER_HOTELS.items()
+                                 if any(kw in name_upper for kw in kws)), None)
+            if known_match:
+                known_groups.setdefault(known_match, []).append(folder["id"])
+                continue
+
+            if "REVENUE REPORTS" in name_upper:
                 extracted = _extract_hotel_name_from_rev_folder(name) or name
                 norm = extracted.upper()
                 # Merge by substring containment, not exact match — the same
@@ -1460,6 +1481,9 @@ def get_hotels_from_drive():
             has_rev = any("REVENUE REPORTS" in c["name"].upper() for c in children.get("files", []))
             if has_rev:
                 hotels.append((name, folder["id"]))
+
+        for hotel_name, ids in known_groups.items():
+            hotels.append((hotel_name, ids[0] if len(ids) == 1 else MULTI_ID_PREFIX + ",".join(ids)))
 
         for info in rev_groups:
             if len(info["ids"]) == 1:
