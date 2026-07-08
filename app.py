@@ -5,6 +5,7 @@ import io
 import re
 import datetime
 import hashlib
+import json
 import bcrypt
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -2325,33 +2326,165 @@ def _load_wb_from_drive(svc, hotel_id, hotel_name, wb_type, month_date, data_onl
         return None
 
 
+# ── User accounts (self-serve requests + admin approval) ─────────────────────
+# Streamlit Cloud's filesystem is ephemeral and st.secrets is read-only at
+# runtime, so per-person accounts created through the app can't live in either
+# — store them in a small JSON file in Drive instead, using the exact same
+# download/upload plumbing already used for every workbook in this app.
+
+APP_DATA_FOLDER_NAME = "ROB Updater App Data"
+USERS_FILE_NAME      = "users.json"
+
+
+def _find_app_data_folder(service):
+    """Find the shared App Data folder. Must be created once and shared with
+    the service account, the same way every hotel's Drive folder is."""
+    q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
+         "and name = '%s'") % APP_DATA_FOLDER_NAME
+    result = service.files().list(
+        q=q, fields="files(id, name)", pageSize=5,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
+    files = result.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def _find_or_create_users_file(service):
+    """Return (file_id, error). error is a user-facing string when the App
+    Data folder itself hasn't been created/shared yet — creates users.json
+    inside it (empty) on first use otherwise."""
+    folder_id = _find_app_data_folder(service)
+    if not folder_id:
+        return None, (f"Drive folder '{APP_DATA_FOLDER_NAME}' not found. Create it in "
+                       f"Google Drive and share it with the service account (same as a "
+                       f"hotel folder), then try again.")
+    q = "'%s' in parents and trashed = false and name = '%s'" % (folder_id, USERS_FILE_NAME)
+    result = service.files().list(
+        q=q, fields="files(id, name)", pageSize=5,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
+    files = result.get("files", [])
+    if files:
+        return files[0]["id"], None
+    empty = json.dumps({"users": []}).encode("utf-8")
+    media = MediaIoBaseUpload(io.BytesIO(empty), mimetype="application/json", resumable=True)
+    created = service.files().create(
+        body={"name": USERS_FILE_NAME, "parents": [folder_id]},
+        media_body=media, fields="id", supportsAllDrives=True,
+    ).execute()
+    return created["id"], None
+
+
+def _load_users(service, file_id):
+    """Return the list of user dicts from users.json (empty list if unreadable)."""
+    try:
+        raw = drive_download(service, file_id)
+        return json.loads(raw.decode("utf-8")).get("users", [])
+    except Exception:
+        return []
+
+
+def _save_users(service, file_id, users):
+    payload = json.dumps({"users": users}, indent=2).encode("utf-8")
+    drive_upload(service, file_id, payload, USERS_FILE_NAME)
+
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Linchris Weekly Tools", layout="wide")
 
 # ── Login gate ────────────────────────────────────────────────────────────────
-def check_login(username: str, password: str) -> bool:
-    correct_user = st.secrets["auth"]["username"]
-    correct_hash = st.secrets["auth"]["password_hash"].encode()
-    return username == correct_user and bcrypt.checkpw(password.encode(), correct_hash)
+def check_login(username: str, password: str):
+    """Return (ok, is_admin). Checks the single admin account (Streamlit
+    secrets) first, then falls back to approved entries in users.json."""
+    admin_user = st.secrets["auth"]["username"]
+    admin_hash = st.secrets["auth"]["password_hash"].encode()
+    if username == admin_user and bcrypt.checkpw(password.encode(), admin_hash):
+        return True, True
+
+    try:
+        svc = get_drive_service()
+        file_id, err = _find_or_create_users_file(svc)
+        if err:
+            return False, False
+        users = _load_users(svc, file_id)
+    except Exception:
+        return False, False
+
+    for u in users:
+        if (u.get("username") == username and u.get("status") == "approved"
+                and bcrypt.checkpw(password.encode(), u.get("password_hash", "").encode())):
+            return True, False
+    return False, False
+
 
 LOGIN_ENABLED = True
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
+    st.session_state["is_admin"] = False
+    st.session_state["username"] = None
 
 if LOGIN_ENABLED and not st.session_state["authenticated"]:
     st.title("Linchris Hotel Corporation")
     st.subheader("Please log in to continue")
-    with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Log In")
-        if submitted:
-            if check_login(username, password):
-                st.session_state["authenticated"] = True
-                st.rerun()
-            else:
-                st.error("Incorrect username or password.")
+
+    login_tab, request_tab = st.tabs(["Log In", "Request Access"])
+
+    with login_tab:
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Log In")
+            if submitted:
+                ok, is_admin = check_login(username, password)
+                if ok:
+                    st.session_state["authenticated"] = True
+                    st.session_state["is_admin"] = is_admin
+                    st.session_state["username"] = username
+                    st.rerun()
+                else:
+                    st.error("Incorrect username or password — or your account is still pending admin approval.")
+
+    with request_tab:
+        st.caption("Submit a request for access. An admin needs to approve it before you can log in.")
+        with st.form("request_access_form"):
+            new_username      = st.text_input("Choose a username", key="req_username")
+            display_name      = st.text_input("Your name", key="req_display_name")
+            new_password      = st.text_input("Choose a password", type="password", key="req_password")
+            confirm_password  = st.text_input("Confirm password", type="password", key="req_confirm")
+            req_submitted     = st.form_submit_button("Request Access")
+            if req_submitted:
+                admin_user = st.secrets["auth"]["username"]
+                if not new_username or not new_password:
+                    st.error("Username and password are required.")
+                elif new_password != confirm_password:
+                    st.error("Passwords don't match.")
+                elif new_username == admin_user:
+                    st.error("That username is reserved.")
+                else:
+                    try:
+                        svc = get_drive_service()
+                        file_id, err = _find_or_create_users_file(svc)
+                        if err:
+                            st.error(err)
+                        else:
+                            users = _load_users(svc, file_id)
+                            if any(u.get("username") == new_username for u in users):
+                                st.error("That username is already taken or already has a pending request.")
+                            else:
+                                users.append({
+                                    "username":      new_username,
+                                    "password_hash": bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode(),
+                                    "display_name":  display_name,
+                                    "status":        "pending",
+                                    "requested_at":  datetime.datetime.now().isoformat(),
+                                    "decided_at":    None,
+                                })
+                                _save_users(svc, file_id, users)
+                                st.success("Request submitted — an admin needs to approve it before you can log in.")
+                    except Exception as e:
+                        st.error(f"Could not submit request: {e}")
+
     st.stop()
 
 st.markdown("""
@@ -2397,12 +2530,125 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-title_col, toggle_col = st.columns([6, 1])
+if "view" not in st.session_state:
+    st.session_state["view"] = "main"
+
+
+def render_admin_settings(svc, users_file_id, users_err):
+    st.title("Admin Settings")
+    if st.button("← Back to app"):
+        st.session_state["view"] = "main"
+        st.rerun()
+
+    if users_err:
+        st.warning(f"Account requests unavailable: {users_err}")
+        return
+
+    all_users  = _load_users(svc, users_file_id)
+    admin_user = st.secrets["auth"]["username"]
+
+    st.subheader("Pending Requests")
+    pending = [u for u in all_users if u.get("status") == "pending"]
+    if not pending:
+        st.caption("No pending requests.")
+    for u in pending:
+        c1, c2, c3, c4 = st.columns([3, 3, 1, 1])
+        c1.write(f"**{u.get('username')}**")
+        c2.write(u.get("display_name") or "—")
+        if c3.button("Approve", key=f"approve_{u.get('username')}"):
+            for uu in all_users:
+                if uu.get("username") == u.get("username"):
+                    uu["status"] = "approved"
+                    uu["decided_at"] = datetime.datetime.now().isoformat()
+            _save_users(svc, users_file_id, all_users)
+            st.rerun()
+        if c4.button("Reject", key=f"reject_{u.get('username')}"):
+            all_users = [uu for uu in all_users if uu.get("username") != u.get("username")]
+            _save_users(svc, users_file_id, all_users)
+            st.rerun()
+
+    st.divider()
+
+    st.subheader("All Users")
+    rows = [{"Username": admin_user, "Name": "—", "Role": "Admin", "Status": "approved"}]
+    for u in all_users:
+        rows.append({
+            "Username": u.get("username"),
+            "Name":     u.get("display_name") or "—",
+            "Role":     "Standard User",
+            "Status":   u.get("status"),
+        })
+    st.dataframe(rows, use_container_width=True)
+
+    approved = [u for u in all_users if u.get("status") == "approved"]
+    if approved:
+        st.caption("Revoke access:")
+        for u in approved:
+            rc1, rc2 = st.columns([5, 1])
+            rc1.write(f"{u.get('username')} ({u.get('display_name') or '—'})")
+            if rc2.button("Revoke", key=f"revoke_{u.get('username')}"):
+                all_users = [uu for uu in all_users if uu.get("username") != u.get("username")]
+                _save_users(svc, users_file_id, all_users)
+                st.rerun()
+
+    st.divider()
+
+    st.subheader("Add New User")
+    st.caption("Creates and approves an account directly — skips the request/approval step.")
+    with st.form("admin_add_user_form"):
+        new_username = st.text_input("Username", key="admin_new_username")
+        new_display  = st.text_input("Name", key="admin_new_display")
+        new_password = st.text_input("Password", type="password", key="admin_new_password")
+        submitted = st.form_submit_button("Add User")
+        if submitted:
+            if not new_username or not new_password:
+                st.error("Username and password are required.")
+            elif new_username == admin_user or any(u.get("username") == new_username for u in all_users):
+                st.error("That username is already taken.")
+            else:
+                all_users.append({
+                    "username":      new_username,
+                    "password_hash": bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode(),
+                    "display_name":  new_display,
+                    "status":        "approved",
+                    "requested_at":  datetime.datetime.now().isoformat(),
+                    "decided_at":    datetime.datetime.now().isoformat(),
+                })
+                _save_users(svc, users_file_id, all_users)
+                st.success(f"User '{new_username}' added and approved.")
+                st.rerun()
+
+
+title_col, toggle_col, profile_col = st.columns([5, 1, 1])
 with title_col:
     st.title("Linchris Hotel Corporation — Weekly Update Tools")
 with toggle_col:
     st.write("")
     test_mode = st.toggle("Test Mode", value=False, key="test_mode")
+with profile_col:
+    st.write("")
+    with st.popover(f"👤 {st.session_state.get('username') or 'Account'}"):
+        st.write(f"**{st.session_state.get('username')}**")
+        st.caption("Admin" if st.session_state.get("is_admin") else "Standard User")
+        if st.session_state.get("is_admin"):
+            if st.button("⚙️ Admin Settings", key="open_admin_settings"):
+                st.session_state["view"] = "admin_settings"
+                st.rerun()
+        if st.button("Log Out", key="logout_btn"):
+            st.session_state["authenticated"] = False
+            st.session_state["is_admin"] = False
+            st.session_state["username"] = None
+            st.session_state["view"] = "main"
+            st.rerun()
+
+if st.session_state.get("view") == "admin_settings" and st.session_state.get("is_admin"):
+    try:
+        _admin_svc = get_drive_service()
+        _users_file_id, _users_err = _find_or_create_users_file(_admin_svc)
+    except Exception as e:
+        _users_file_id, _users_err = None, str(e)
+    render_admin_settings(_admin_svc, _users_file_id, _users_err)
+    st.stop()
 
 # ── Manual upload (test mode only) ───────────────────────────────────────────
 if test_mode:
