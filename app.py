@@ -1632,7 +1632,7 @@ def drive_find_file(service, keyword, parent_id):
 
 def drive_download(service, file_id) -> bytes:
     buf = io.BytesIO()
-    req = service.files().get_media(fileId=file_id)
+    req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
     dl  = MediaIoBaseDownload(buf, req)
     done = False
     while not done:
@@ -1648,7 +1648,12 @@ def drive_upload(service, file_id, file_bytes: bytes, file_name: str):
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         resumable=True,
     )
-    service.files().update(fileId=file_id, media_body=media).execute()
+    # supportsAllDrives is required here even though drive_download's
+    # get_media() works without it — confirmed real case: writing back to a
+    # Shared Drive file (Hyannis Anchor In) 404'd on update() alone, for
+    # every workbook type, despite the same file_id having just been read
+    # successfully moments earlier.
+    service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
 
 
 def drive_find_or_create_month_folder(service, rev_id: str, year_id: str, month_date: datetime.date, hotel_name: str):
