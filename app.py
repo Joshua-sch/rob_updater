@@ -167,31 +167,92 @@ def _is_done_color(rgb_value) -> bool:
 
 
 def first_uncolored_sheet(wb, sheet_names):
-    """Return the first sheet in sheet_names not marked done (our green).
-    A master template can have its own unrelated tab color baked in (e.g. a
-    legacy marker on 'wk one') — only our own green 'done' color counts as
-    done, otherwise a real upload silently skips a week that isn't finished.
+    """Return the first ROB week tab that is neither marked done (our green)
+    nor already holding real data in this month's block.
+
+    Color alone isn't enough in either direction: a master template can carry
+    its own unrelated baked-in tab color on a sheet that's never been touched
+    (so "any color = done" produces false positives), while a real, already-
+    filled week can fail to carry our exact green (so "only our green = done"
+    produces false negatives — confirmed on a real hotel: week one already had
+    this month's Revenue/Room Nights filled in but got silently re-picked and
+    overwritten because its tab color didn't match). Checking actual data in
+    the cells this month's update is about to write closes that gap.
     """
+    today = datetime.date.today()
+    block_start = 4 + 8 * (today.month - 1)
     for name in sheet_names:
         ws = wb[name]
         tc = ws.sheet_properties.tabColor
-        if tc is None or not _is_done_color(getattr(tc, "rgb", None)):
-            return name
+        if tc is not None and _is_done_color(getattr(tc, "rgb", None)):
+            continue
+        rev = ws.cell(block_start + 1, 5).value
+        rms = ws.cell(block_start + 2, 5).value
+        if isinstance(rev, (int, float)) or isinstance(rms, (int, float)):
+            continue
+        return name
     return sheet_names[-1]  # fallback: last sheet
 
 
 def first_unhighlighted_forecast_sheet(wb, sheet_names):
-    """Return the first Forecast week tab with NO tab color at all.
+    """Return the first Forecast week tab that is neither marked done (our
+    green) nor already holding real OTB Rooms Sold data.
 
-    Unlike ROB/Strategy Report, hotels color-code Forecast week tabs by hand
-    with whatever color they like (seen in practice: our own green, but also
-    ad-hoc magenta, bright green, etc.) to mark a week as touched/reviewed —
-    there's no single fixed 'done' color to match. So here ANY tab color means
-    the week has been dealt with; only a genuinely uncolored tab is next.
+    Tab color alone can't be trusted in either direction here: hotels color-
+    code Forecast tabs by hand with whatever color they like, but the SAME
+    color can also be a stray artifact baked into a never-used master
+    template — confirmed on real files: Hampton's untouched master has ALL 9
+    week tabs pre-colored, and Provincetown Brass's untouched master has
+    FCST-WK1 pre-colored magenta despite being completely blank. Checking the
+    OTB Rooms Sold row for actual filled-in numbers is the reliable signal;
+    our own exact green is kept as a secondary check for weeks we marked done
+    ourselves but that ended up with no literal numbers written (e.g. every
+    cell in that row happened to be formula-protected).
     """
     for name in sheet_names:
-        if wb[name].sheet_properties.tabColor is None:
-            return name
+        if name not in wb.sheetnames:
+            continue
+        ws = wb[name]
+        tc = ws.sheet_properties.tabColor
+        if tc is not None and _is_done_color(getattr(tc, "rgb", None)):
+            continue
+        rows = locate_forecast_rows(ws)
+        if not rows:
+            return name  # can't verify — treat as available rather than guess
+        otb_row = rows["otb_rooms_row"]
+        has_data = any(isinstance(ws.cell(otb_row, c).value, (int, float)) for c in range(2, 10))
+        if has_data:
+            continue
+        return name
+    return sheet_names[-1]  # fallback: last sheet
+
+
+def first_undone_strategy_sheet(wb, sheet_names):
+    """Return the first Strategy Report week tab that is neither marked done
+    (our green) nor already holding real OTB TY Trans data.
+
+    Same reasoning as first_unhighlighted_forecast_sheet: tab color alone
+    can't be trusted — confirmed on real files that the identical purple
+    (FF9900FF) marks a genuinely completed Surfside week AND sits untouched
+    on Wolfboro's never-used master template. Check actual filled data as the
+    reliable signal; our own exact green is a secondary check for weeks we
+    marked done ourselves but that ended up with no literal numbers written.
+    """
+    for name in sheet_names:
+        if name not in wb.sheetnames:
+            continue
+        ws = wb[name]
+        tc = ws.sheet_properties.tabColor
+        if tc is not None and _is_done_color(getattr(tc, "rgb", None)):
+            continue
+        col_map = detect_strategy_columns(ws)
+        otb_col = col_map.get("otb_trans")
+        if not otb_col:
+            return name  # can't verify — treat as available rather than guess
+        has_data = any(isinstance(ws.cell(r, otb_col).value, (int, float)) for r in range(5, 15))
+        if has_data:
+            continue
+        return name
     return sheet_names[-1]  # fallback: last sheet
 
 
@@ -323,8 +384,18 @@ def detect_date_column(ws):
     """Find the column whose data rows (5+) contain the earliest daily dates —
     i.e. the column that maps to each row's actual calendar date.
     Scans cols 1-10 only (dates are always on the left side).
+
+    A sheet commonly has a Last Year date column right next to the This Year
+    one (e.g. col 1 = LY dates, col 3 = TY dates), both starting on the 1st
+    of the same month in different years — under a pure "most consecutive,
+    prefer earliest day-of-month" score they tie exactly, and confirmed on a
+    real file (Anchor In) the tie silently kept the LY column, so the whole
+    date-to-row map was built a year off and almost nothing matched the CSV.
+    Breaking ties by which column's dates start closest to today reliably
+    picks the current/forward-looking column instead.
     """
     import collections
+    today = datetime.date.today()
     col_dates = collections.defaultdict(list)
     for r in range(5, min(ws.max_row + 1, 15)):
         for c in range(1, 11):
@@ -334,8 +405,7 @@ def detect_date_column(ws):
             elif isinstance(v, datetime.date):
                 col_dates[c].append(v)
 
-    # Pick the col with the most dates that form a consecutive daily sequence
-    best_col, best_score = 3, 0  # fallback to col 3
+    best_col, best_consecutive, best_proximity = 3, -1, None  # fallback to col 3
     for c, dates in col_dates.items():
         if len(dates) < 3:
             continue
@@ -344,10 +414,12 @@ def detect_date_column(ws):
             1 for i in range(1, len(dates_sorted))
             if (dates_sorted[i] - dates_sorted[i-1]).days == 1
         )
-        # Prefer the col with earliest starting date (first of month)
-        score = consecutive * 10 - dates_sorted[0].day
-        if score > best_score:
-            best_score = score
+        proximity = abs((dates_sorted[0] - today).days)
+        if consecutive > best_consecutive or (
+            consecutive == best_consecutive and (best_proximity is None or proximity < best_proximity)
+        ):
+            best_consecutive = consecutive
+            best_proximity = proximity
             best_col = c
     return best_col
 
@@ -593,14 +665,18 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
     prev_otb_map = {}
     src_sheet = None
     if sheet_name == "WKONE" and col_map.get("otb_lst_wk") and prev_month_wb:
-        prev_sheet = first_uncolored_sheet(prev_month_wb, STRATEGY_SHEETS)
-        # Use last FILLED tab (opposite of first_uncolored — last colored tab)
+        # Use last FILLED tab (opposite of first_undone) — checked by actual
+        # OTB data, not tab color (see first_undone_strategy_sheet: the same
+        # color can mark a genuinely completed week OR sit untouched on a
+        # never-used master template, so color alone can't tell "filled").
         last_filled = None
         for s in STRATEGY_SHEETS:
-            if s in prev_month_wb.sheetnames:
-                tc = prev_month_wb[s].sheet_properties.tabColor
-                if tc is not None:
-                    last_filled = s
+            if s not in prev_month_wb.sheetnames:
+                continue
+            pcol_map = detect_strategy_columns(prev_month_wb[s])
+            potb_col = pcol_map.get("otb_trans")
+            if potb_col and any(isinstance(prev_month_wb[s].cell(r, potb_col).value, (int, float)) for r in range(5, 15)):
+                last_filled = s
         src_sheet = last_filled or (STRATEGY_SHEETS[-1] if STRATEGY_SHEETS[-1] in prev_month_wb.sheetnames else None)
         if src_sheet:
             prev_otb_map = _extract_otb_trans_by_date(prev_month_wb, src_sheet, scope_start)
@@ -2417,7 +2493,7 @@ if test_mode:
             xl_bytes2 = xl_file2.read()
             wb2_peek  = openpyxl.load_workbook(io.BytesIO(xl_bytes2), data_only=False)
 
-            auto_sheet2 = first_uncolored_sheet(wb2_peek, STRATEGY_SHEETS)
+            auto_sheet2 = first_undone_strategy_sheet(wb2_peek, STRATEGY_SHEETS)
 
             # Same stale-selection issue as ROB/Forecast: force a reset whenever
             # the uploaded file's bytes change, since index= is ignored once
@@ -2865,6 +2941,13 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
         ly_month_dt   = current_month.replace(year=current_month.year - 1)
         prev_month_sr_wb = _load_wb_from_drive(svc, hotel_id, hotel_sel, "Strategy Report", prev_month_dt, data_only=False)
         ly_sr_wb         = _load_wb_from_drive(svc, hotel_id, hotel_sel, "Strategy Report", ly_month_dt)
+        # Comp Set LY / OTB LY Trans / GRP LY etc. all come from ly_sr_wb — if it's
+        # not found, those fields silently produce nothing (no warning previously),
+        # which looked like "dates transferred but no text" with no explanation why.
+        st.info(f"SR reference workbooks — Prev month ({prev_month_dt.strftime('%b %Y')}): "
+                f"{'✓ found' if prev_month_sr_wb else '✗ NOT FOUND — OTB Lst Wek will be blank'} | "
+                f"Last year ({ly_month_dt.strftime('%b %Y')}): "
+                f"{'✓ found' if ly_sr_wb else '✗ NOT FOUND — all LY columns (incl. Comp Set LY text) will be blank'}")
 
     for wb_type in wb_sels:
         result, err = resolve_drive_workbook(svc, hotel_id, hotel_sel, wb_type)
@@ -2882,7 +2965,7 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
             warnings = []
         elif wb_type == "Strategy Report":
             avail    = [s for s in STRATEGY_SHEETS if s in wb.sheetnames]
-            auto     = first_uncolored_sheet(wb, avail)
+            auto     = first_undone_strategy_sheet(wb, avail)
             sheet    = auto or avail[0]
             date_row_map_debug = build_date_row_map(wb)
             st.info(f"SR: **{file_name}** → sheet **{sheet}** | "
