@@ -2342,10 +2342,20 @@ if test_mode:
     
             df = parse_csv(csv_bytes)
             wb = openpyxl.load_workbook(io.BytesIO(xl_bytes), data_only=False)
-    
+
             auto_sheet = first_uncolored_sheet(wb, ROB_SHEETS)
-            sheet_choice = st.selectbox("Week tab", ROB_SHEETS,
-                                        index=ROB_SHEETS.index(auto_sheet), key="rob_sheet")
+
+            # A selectbox's `index=` is only honored the first time its `key` is
+            # created — once rob_sheet exists in session_state, Streamlit ignores
+            # index= on every rerun and keeps the old selection. Force a reset
+            # whenever the uploaded file's bytes change (see the identical fix
+            # applied to the Forecast manual-upload tab).
+            rob_xl_hash = hashlib.md5(xl_bytes).hexdigest()
+            if st.session_state.get("rob_xl_hash") != rob_xl_hash:
+                st.session_state["rob_xl_hash"] = rob_xl_hash
+                st.session_state["rob_sheet"] = auto_sheet
+
+            sheet_choice = st.selectbox("Week tab", ROB_SHEETS, key="rob_sheet")
             st.caption(f"Auto-detected next tab: **{auto_sheet}**")
     
             if st.button("Preview Changes", key="rob_preview"):
@@ -2406,10 +2416,18 @@ if test_mode:
         if xl_file2:
             xl_bytes2 = xl_file2.read()
             wb2_peek  = openpyxl.load_workbook(io.BytesIO(xl_bytes2), data_only=False)
-    
-            auto_sheet2   = first_uncolored_sheet(wb2_peek, STRATEGY_SHEETS)
-            sheet_choice2 = st.selectbox("Week tab", STRATEGY_SHEETS,
-                                         index=STRATEGY_SHEETS.index(auto_sheet2), key="str_sheet")
+
+            auto_sheet2 = first_uncolored_sheet(wb2_peek, STRATEGY_SHEETS)
+
+            # Same stale-selection issue as ROB/Forecast: force a reset whenever
+            # the uploaded file's bytes change, since index= is ignored once
+            # str_sheet already exists in session_state.
+            str_xl_hash = hashlib.md5(xl_bytes2).hexdigest()
+            if st.session_state.get("str_xl_hash") != str_xl_hash:
+                st.session_state["str_xl_hash"] = str_xl_hash
+                st.session_state["str_sheet"] = auto_sheet2
+
+            sheet_choice2 = st.selectbox("Week tab", STRATEGY_SHEETS, key="str_sheet")
             st.caption(f"Auto-detected next tab: **{auto_sheet2}**")
     
             if (csv_file2 or rate_file2) and st.button("Preview Changes", key="str_preview"):
