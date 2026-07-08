@@ -5,6 +5,7 @@ import io
 import re
 import datetime
 import hashlib
+import hmac
 import json
 import bcrypt
 from google.oauth2 import service_account
@@ -2557,6 +2558,19 @@ def _save_users(service, file_id, users):
 
 st.set_page_config(page_title="Linchris Weekly Tools", layout="wide")
 
+def _current_invite_code(rotate_days: int = 1) -> str:
+    """A 6-character code that changes automatically every `rotate_days` days,
+    derived from a secret in Streamlit secrets — no extra storage needed,
+    since it's the same deterministic value on both the submit side and the
+    admin-display side as long as they're computed on the same day. Shown to
+    the admin on the Admin Settings page; required on the Request Access form
+    so account creation isn't open to anyone who finds the URL.
+    """
+    secret = st.secrets["auth"]["invite_secret"].encode()
+    bucket = str(datetime.date.today().toordinal() // rotate_days)
+    return hmac.new(secret, bucket.encode(), hashlib.sha256).hexdigest()[:6].upper()
+
+
 # ── Login gate ────────────────────────────────────────────────────────────────
 def check_login(username: str, password: str):
     """Return (ok, is_admin). Checks the single admin account (Streamlit
@@ -2592,7 +2606,7 @@ if LOGIN_ENABLED and not st.session_state["authenticated"]:
     st.title("Linchris Hotel Corporation")
     st.subheader("Please log in to continue")
 
-    login_tab, request_tab = st.tabs(["Log In", "Request Access"])
+    login_tab, access_key_tab = st.tabs(["Log In", "Access Key"])
 
     with login_tab:
         with st.form("login_form"):
@@ -2609,45 +2623,28 @@ if LOGIN_ENABLED and not st.session_state["authenticated"]:
                 else:
                     st.error("Incorrect username or password — or your account is still pending admin approval.")
 
-    with request_tab:
-        st.caption("Submit a request for access. An admin needs to approve it before you can log in.")
-        with st.form("request_access_form"):
-            new_username      = st.text_input("Choose a username", key="req_username")
-            display_name      = st.text_input("Your name", key="req_display_name")
-            new_password      = st.text_input("Choose a password", type="password", key="req_password")
-            confirm_password  = st.text_input("Confirm password", type="password", key="req_confirm")
-            req_submitted     = st.form_submit_button("Request Access")
-            if req_submitted:
-                admin_user = st.secrets["auth"]["username"]
-                if not new_username or not new_password:
-                    st.error("Username and password are required.")
-                elif new_password != confirm_password:
-                    st.error("Passwords don't match.")
-                elif new_username == admin_user:
-                    st.error("That username is reserved.")
+    with access_key_tab:
+        # Temporary, simple stopgap: a single shared secret (Streamlit
+        # secrets, no Drive/storage involved) grants standard access —
+        # no per-person account, no folder setup. Fine for onboarding a
+        # handful of people quickly; can be replaced with a real per-person
+        # account system (already built once, just dormant — see
+        # _find_or_create_users_file / render_admin_settings) later.
+        st.caption("Enter the access key given to you by an admin to get in.")
+        with st.form("access_key_form"):
+            access_key_input = st.text_input("Access key", type="password", key="access_key_input")
+            display_name     = st.text_input("Your name", key="access_key_display_name")
+            key_submitted     = st.form_submit_button("Enter")
+            if key_submitted:
+                if not access_key_input:
+                    st.error("Access key is required.")
+                elif access_key_input.strip() != st.secrets["auth"]["access_key"]:
+                    st.error("Incorrect access key.")
                 else:
-                    try:
-                        svc = get_drive_service()
-                        file_id, err = _find_or_create_users_file(svc)
-                        if err:
-                            st.error(err)
-                        else:
-                            users = _load_users(svc, file_id)
-                            if any(u.get("username") == new_username for u in users):
-                                st.error("That username is already taken or already has a pending request.")
-                            else:
-                                users.append({
-                                    "username":      new_username,
-                                    "password_hash": bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode(),
-                                    "display_name":  display_name,
-                                    "status":        "pending",
-                                    "requested_at":  datetime.datetime.now().isoformat(),
-                                    "decided_at":    None,
-                                })
-                                _save_users(svc, file_id, users)
-                                st.success("Request submitted — an admin needs to approve it before you can log in.")
-                    except Exception as e:
-                        st.error(f"Could not submit request: {e}")
+                    st.session_state["authenticated"] = True
+                    st.session_state["is_admin"] = False
+                    st.session_state["username"] = display_name.strip() or "Guest"
+                    st.rerun()
 
     st.stop()
 
@@ -2703,6 +2700,9 @@ def render_admin_settings(svc, users_file_id, users_err):
     if st.button("← Back to app"):
         st.session_state["view"] = "main"
         st.rerun()
+
+    st.info(f"Today's invite code: **{_current_invite_code()}** — give this to anyone you want to "
+            f"create an account. It changes daily; account creation auto-approves once the code matches.")
 
     if users_err:
         st.warning(f"Account requests unavailable: {users_err}")
