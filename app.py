@@ -1381,6 +1381,14 @@ def get_hotels_from_drive():
     """Return list of (display_name, folder_id) for every top-level folder
     that contains a 'REVENUE REPORTS' subfolder — i.e. each hotel folder.
     Cached for 5 minutes so it doesn't hit Drive on every rerender.
+
+    Some hotels are shared with the service account directly at the REVENUE
+    REPORTS folder itself, not its parent — this happens on Shared Drives
+    where the person granting access can only share folders they themselves
+    have permission on, and Drive permissions don't propagate upward to a
+    parent. In that case the service account can't see any parent folder at
+    all, so a REVENUE-REPORTS-named top-level folder is treated as the hotel
+    entry directly instead of being skipped.
     """
     try:
         svc = get_drive_service()
@@ -1395,6 +1403,7 @@ def get_hotels_from_drive():
         for folder in folders:
             name = folder["name"]
             if "REVENUE REPORTS" in name.upper():
+                hotels.append((name, folder["id"]))
                 continue
             if re.search(r'\b20\d{2}\b', name):
                 continue
@@ -1475,6 +1484,20 @@ def _find_rev_reports_folder_for_year(service, hotel_id, year_kw):
         return year_match["id"], year_match["name"]
     if candidates:
         return candidates[0]["id"], candidates[0]["name"]
+
+    # Some hotels are shared directly at the REVENUE REPORTS folder level
+    # (Shared Drive permissions don't propagate to a parent folder) — hotel_id
+    # IS that folder already in that case, not its parent, so there's no
+    # child to find. Check hotel_id's own name before giving up.
+    try:
+        self_info = service.files().get(
+            fileId=hotel_id, fields="name", supportsAllDrives=True
+        ).execute()
+        if "revenue reports" in self_info.get("name", "").lower():
+            return hotel_id, self_info["name"]
+    except Exception:
+        pass
+
     return None, None
 
 
@@ -2224,22 +2247,36 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
             return None, f"Resolved file '{fname}' looks like a master doc — aborting."
         return (fid, fname), None
 
+    # Some hotels are shared with the service account directly at the
+    # REVENUE REPORTS folder level (Shared Drive permissions don't propagate
+    # to a parent folder, so if only that folder was shared, hotel_id IS it —
+    # there's no separate parent to search). Detect this from hotel_name
+    # (get_hotels_from_drive surfaces such a folder using its own name,
+    # which contains "REVENUE REPORTS") and skip straight to structure B
+    # using hotel_id's own children as the rev-reports children.
+    self_is_rev = "REVENUE REPORTS" in hotel_name.upper()
+
     hotel_children = _list_subfolders(hotel_id)
 
     # A: Hotel > MMMYYYY REVENUE REPORTS HOTEL > file
-    a = next((f for f in hotel_children
-               if "REVENUE REPORTS" in f["name"].upper() and month_kw in f["name"].upper()), None)
+    a = None
+    if not self_is_rev:
+        a = next((f for f in hotel_children
+                   if "REVENUE REPORTS" in f["name"].upper() and month_kw in f["name"].upper()), None)
     if a:
         return _find_file_in(a["id"], a["name"])
 
     # B: Hotel > REVENUE REPORTS > MMMYYYY ... > file  (month folder inside rev-reports)
-    # Prefer the revenue reports folder that also matches the target year
-    rev = next((f for f in hotel_children
-                if "REVENUE REPORTS" in f["name"].upper() and year_kw in f["name"]), None)
-    if not rev:
-        rev = next((f for f in hotel_children if "REVENUE REPORTS" in f["name"].upper()), None)
+    if self_is_rev:
+        rev = {"id": hotel_id, "name": hotel_name}
+    else:
+        # Prefer the revenue reports folder that also matches the target year
+        rev = next((f for f in hotel_children
+                    if "REVENUE REPORTS" in f["name"].upper() and year_kw in f["name"]), None)
+        if not rev:
+            rev = next((f for f in hotel_children if "REVENUE REPORTS" in f["name"].upper()), None)
     if rev:
-        rev_children = _list_subfolders(rev["id"])
+        rev_children = hotel_children if self_is_rev else _list_subfolders(rev["id"])
         # B1: month folder directly inside REVENUE REPORTS
         b1 = next((f for f in rev_children if month_kw in f["name"].upper()), None)
         if b1:
