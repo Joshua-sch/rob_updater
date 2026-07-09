@@ -2801,7 +2801,7 @@ def check_login(username: str, password: str):
     for u in users:
         if (u.get("username") == username and u.get("status") == "approved"
                 and bcrypt.checkpw(password.encode(), u.get("password_hash", "").encode())):
-            return True, False
+            return True, u.get("role") == "admin"
     return False, False
 
 
@@ -2949,18 +2949,28 @@ def render_admin_settings(svc, users_file_id, users_err):
         rows.append({
             "Username": u.get("username"),
             "Name":     u.get("display_name") or "—",
-            "Role":     "Standard User",
+            "Role":     "Admin" if u.get("role") == "admin" else "Editor",
             "Status":   u.get("status"),
         })
     st.dataframe(rows, use_container_width=True)
 
     approved = [u for u in all_users if u.get("status") == "approved"]
     if approved:
-        st.caption("Revoke access:")
+        st.caption("Change role / revoke access:")
         for u in approved:
-            rc1, rc2 = st.columns([5, 1])
+            rc1, rc2, rc3 = st.columns([4, 2, 1])
             rc1.write(f"{u.get('username')} ({u.get('display_name') or '—'})")
-            if rc2.button("Revoke", key=f"revoke_{u.get('username')}"):
+            current_role = "Admin" if u.get("role") == "admin" else "Editor"
+            new_role = rc2.selectbox("Role", ["Editor", "Admin"],
+                                      index=["Editor", "Admin"].index(current_role),
+                                      key=f"role_{u.get('username')}", label_visibility="collapsed")
+            if new_role.lower() != u.get("role", "editor"):
+                for uu in all_users:
+                    if uu.get("username") == u.get("username"):
+                        uu["role"] = new_role.lower()
+                _save_users(svc, users_file_id, all_users)
+                st.rerun()
+            if rc3.button("Revoke", key=f"revoke_{u.get('username')}"):
                 all_users = [uu for uu in all_users if uu.get("username") != u.get("username")]
                 _save_users(svc, users_file_id, all_users)
                 st.rerun()
@@ -2973,6 +2983,8 @@ def render_admin_settings(svc, users_file_id, users_err):
         new_username = st.text_input("Username", key="admin_new_username")
         new_display  = st.text_input("Name", key="admin_new_display")
         new_password = st.text_input("Password", type="password", key="admin_new_password")
+        new_role     = st.selectbox("Role", ["Editor", "Admin"], key="admin_new_role",
+                                     help="Editor: normal app access, no Admin Settings. Admin: full access including this page.")
         submitted = st.form_submit_button("Add User")
         if submitted:
             if not new_username or not new_password:
@@ -2984,12 +2996,13 @@ def render_admin_settings(svc, users_file_id, users_err):
                     "username":      new_username,
                     "password_hash": bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode(),
                     "display_name":  new_display,
+                    "role":          new_role.lower(),
                     "status":        "approved",
                     "requested_at":  datetime.datetime.now().isoformat(),
                     "decided_at":    datetime.datetime.now().isoformat(),
                 })
                 _save_users(svc, users_file_id, all_users)
-                st.success(f"User '{new_username}' added and approved.")
+                st.success(f"User '{new_username}' added and approved as {new_role}.")
                 st.rerun()
 
 
@@ -3003,7 +3016,7 @@ with profile_col:
     st.write("")
     with st.popover(f"👤 {st.session_state.get('username') or 'Account'}"):
         st.write(f"**{st.session_state.get('username')}**")
-        st.caption("Admin" if st.session_state.get("is_admin") else "Standard User")
+        st.caption("Admin" if st.session_state.get("is_admin") else "Editor")
         if st.session_state.get("is_admin"):
             if st.button("⚙️ Admin Settings", key="open_admin_settings"):
                 st.session_state["view"] = "admin_settings"
