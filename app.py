@@ -145,7 +145,49 @@ def parse_margaritaville_source(file_bytes: bytes) -> pd.DataFrame:
         raise ValueError("No daily rows found in source file.")
 
     max_col = max(max(r.keys()) for r in rows)
-    return pd.DataFrame(rows).reindex(columns=range(max_col + 1))
+    df = pd.DataFrame(rows).reindex(columns=range(max_col + 1))
+    return _add_margaritaville_monthly_totals(df)
+
+
+# Columns build_rob_change_plan reads for a "monthly" row: Revenue, Room
+# Nights, Grp PU, Grp N/PU, Grp Rev. Same column positions the standard
+# Business on the Books CSV already provides monthly totals for directly —
+# Margaritaville's source has no such totals, so they're synthesized here by
+# summing the daily rows for each calendar month present in the data.
+ROB_MONTHLY_SUM_COLS = [1, 5, 7, 8, 9]
+
+
+def _add_margaritaville_monthly_totals(df: pd.DataFrame) -> pd.DataFrame:
+    """Append one synthetic 'monthly' row (e.g. 'Jul 2026') per calendar
+    month present in the daily rows, summing ROB_MONTHLY_SUM_COLS — so
+    build_rob_change_plan (which only reads rows classify_row calls
+    'monthly') works unchanged, the same way it already does for every other
+    hotel's CSV, which provides these totals directly."""
+    sums = {}  # (year, month) -> {col: running sum}
+    for _, row in df.iterrows():
+        date_str = str(row[0]).strip() if row[0] else ""
+        kind, d = classify_row(date_str)
+        if kind != "daily":
+            continue
+        key = (d.year, d.month)
+        bucket = sums.setdefault(key, {c: 0.0 for c in ROB_MONTHLY_SUM_COLS})
+        for c in ROB_MONTHLY_SUM_COLS:
+            v = row.get(c)
+            if v is not None and not pd.isna(v):
+                bucket[c] += v
+
+    if not sums:
+        return df
+
+    monthly_rows = []
+    for (year, month), bucket in sums.items():
+        month_name = datetime.date(year, month, 1).strftime("%b")
+        row_data = {0: f"{month_name} {year}"}
+        row_data.update(bucket)
+        monthly_rows.append(row_data)
+
+    monthly_df = pd.DataFrame(monthly_rows).reindex(columns=df.columns)
+    return pd.concat([df, monthly_df], ignore_index=True)
 
 
 def parse_bob_source(uploaded_file) -> pd.DataFrame:
@@ -174,7 +216,14 @@ def find_secondary_col(ws, block_start):
     return min(candidates) if candidates else None
 
 
-def build_rob_change_plan(df, ws):
+def build_rob_change_plan(df, ws, grp_npu_rev_override: dict = None):
+    """grp_npu_rev_override: optional {(year, month): dollar_value} — when
+    present for a given month, writes that literal value into the 'Group Not
+    P/U rev' secondary-column cell instead of the standard count*ADR formula.
+    Used for Margaritaville, whose source data doesn't include a reliable
+    Not-P/U room count to build that formula from — instead the value is
+    computed elsewhere as the difference between two comparable PMS exports
+    (one including not-yet-picked-up group revenue, one excluding it)."""
     today = datetime.date.today()
     current_month = today.month
     current_year = today.year
@@ -218,13 +267,18 @@ def build_rob_change_plan(df, ws):
             (block_start + 5, 5, "Group Rm Rev",    grp_rvn,   False),
         ]
         if sec_col:
-            from openpyxl.utils import get_column_letter
-            sec_letter = get_column_letter(sec_col)
             npu_row    = block_start + 4
-            adr_row    = block_start + 6
-            npu_formula = f"={sec_letter}{npu_row}*E{adr_row}"
-            entries.append((npu_row,     sec_col, "Group Not P/U rooms",    grp_npu,     False))
-            entries.append((npu_row + 1, sec_col, "Group Not P/U rev (formula)", npu_formula, True))
+            entries.append((npu_row, sec_col, "Group Not P/U rooms", grp_npu, False))
+
+            override_val = grp_npu_rev_override.get((year, month)) if grp_npu_rev_override else None
+            if override_val is not None:
+                entries.append((npu_row + 1, sec_col, "Group Not P/U rev (computed)", override_val, False))
+            else:
+                from openpyxl.utils import get_column_letter
+                sec_letter = get_column_letter(sec_col)
+                adr_row    = block_start + 6
+                npu_formula = f"={sec_letter}{npu_row}*E{adr_row}"
+                entries.append((npu_row + 1, sec_col, "Group Not P/U rev (formula)", npu_formula, True))
 
         for r, c, label, val, is_formula_write in entries:
             skip = None
@@ -236,6 +290,33 @@ def build_rob_change_plan(df, ws):
                              "new_value": val, "skip_reason": skip})
 
     return changes
+
+
+def compute_grp_npu_rev_override(df, npu_compare_df):
+    """Margaritaville ROB only: npu_compare_df is the same source format but
+    from a second PMS export that includes not-yet-picked-up group revenue
+    (df itself is the export that excludes it — confirmed the smaller of the
+    two is used everywhere else). The difference per month is the dollar
+    value for the "Group Not P/U rev" bright-green box on the ROB. Returns
+    None if either input is missing (i.e. every hotel except Margaritaville)."""
+    if npu_compare_df is None or df is None:
+        return None
+
+    def _monthly_col5(source_df):
+        out = {}
+        for _, row in source_df.iterrows():
+            kind, info = classify_row(str(row[0]).strip() if row[0] else "")
+            if kind == "monthly":
+                out[info] = safe_float(row[5])
+        return out
+
+    main_sums    = _monthly_col5(df)
+    compare_sums = _monthly_col5(npu_compare_df)
+    return {
+        key: compare_sums[key] - main_sums[key]
+        for key in main_sums
+        if key in compare_sums and main_sums[key] is not None and compare_sums[key] is not None
+    }
 
 
 def apply_rob_changes(wb, sheet_name, changes):
@@ -2959,14 +3040,17 @@ if test_mode:
  with st.expander("Manual Upload", expanded=False):
     with st.expander("ROB Update"):
         st.header("ROB Master Workbook Update")
-        csv_file = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="rob_csv")
+        csv_file = st.file_uploader("Upload CSV (Business on the Books)", type=["csv", "xlsx"], key="rob_csv")
         xl_file  = st.file_uploader("Upload ROB Master Workbook (.xlsx)", type=["xlsx"], key="rob_xl")
-    
+        npu_compare_file = st.file_uploader(
+            "Occupancy Statistics — with unpicked group revenue included (Margaritaville only, optional)",
+            type=["xlsx"], key="rob_npu_compare")
+
         if csv_file and xl_file:
-            csv_bytes = csv_file.read()
             xl_bytes  = xl_file.read()
-    
-            df = parse_csv(csv_bytes)
+
+            df = parse_bob_source(csv_file)
+            npu_compare_df = parse_bob_source(npu_compare_file) if npu_compare_file else None
             wb = openpyxl.load_workbook(io.BytesIO(xl_bytes), data_only=False)
 
             auto_sheet = first_uncolored_sheet(wb, ROB_SHEETS)
@@ -2986,7 +3070,8 @@ if test_mode:
     
             if st.button("Preview Changes", key="rob_preview"):
                 ws = wb[sheet_choice]
-                changes = build_rob_change_plan(df, ws)
+                grp_npu_rev_override = compute_grp_npu_rev_override(df, npu_compare_df)
+                changes = build_rob_change_plan(df, ws, grp_npu_rev_override=grp_npu_rev_override)
                 st.session_state["rob_changes"]   = changes
                 st.session_state["rob_wb_bytes"]  = xl_bytes
                 st.session_state["rob_sheet_sel"] = sheet_choice
@@ -3307,6 +3392,11 @@ with st.container(border=True):
     drive_rate_csv = None
     if "Strategy Report" in (wb_sels or []):
         drive_rate_csv = st.file_uploader("CSV — Rates & Restrictions", type=["csv"], key=f"drive_rate_csv_{hotel_sel}", width=500)
+    drive_npu_compare_csv = None
+    if "ROB" in (wb_sels or []) and "margaritaville" in hotel_sel.lower():
+        drive_npu_compare_csv = st.file_uploader(
+            "Occupancy Statistics — with unpicked group revenue included",
+            type=["xlsx"], key=f"drive_npu_compare_{hotel_sel}", width=500)
 
     opt_col1, opt_col2 = st.columns(2)
     forecast_next_month = False
@@ -3481,10 +3571,12 @@ if start_new_month:
 
 
 
-def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_next_month=False):
+def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_next_month=False, npu_compare_df=None):
     today = datetime.date.today()
     current_month = today.replace(day=1)
     all_plans = {}
+
+    grp_npu_rev_override = compute_grp_npu_rev_override(df, npu_compare_df)
 
     # Pre-load reference workbooks into memory once — used for cross-sheet lookups
     prev_month_sr_wb = None
@@ -3514,7 +3606,7 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
             avail    = [s for s in ROB_SHEETS if s in wb.sheetnames]
             auto     = first_uncolored_sheet(wb, avail)
             sheet    = auto or avail[0]
-            changes  = build_rob_change_plan(df, wb[sheet])
+            changes  = build_rob_change_plan(df, wb[sheet], grp_npu_rev_override=grp_npu_rev_override)
             warnings = []
         elif wb_type == "Strategy Report":
             avail    = [s for s in STRATEGY_SHEETS if s in wb.sheetnames]
@@ -3680,7 +3772,8 @@ if test_mode:
             svc     = get_drive_service()
             df      = parse_bob_source(drive_csv) if drive_csv else None
             rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
-            st.session_state["drive_plans"]     = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month)
+            npu_compare_df = parse_bob_source(drive_npu_compare_csv) if drive_npu_compare_csv else None
+            st.session_state["drive_plans"]     = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month, npu_compare_df)
             st.session_state["drive_hotel_sel"] = hotel_sel
         except Exception as e:
             st.error(f"Drive error: {e}")
@@ -3722,8 +3815,9 @@ else:
             svc     = get_drive_service()
             df      = parse_bob_source(drive_csv) if drive_csv else None
             rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
+            npu_compare_df = parse_bob_source(drive_npu_compare_csv) if drive_npu_compare_csv else None
             with st.spinner("Updating workbooks in Google Drive..."):
-                all_plans       = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month)
+                all_plans       = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month, npu_compare_df)
                 saved, errors   = apply_and_upload(svc, all_plans)
             for name in saved:
                 st.success(f"Saved **{name}** to Google Drive.")
