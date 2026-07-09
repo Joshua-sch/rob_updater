@@ -66,6 +66,89 @@ def safe_float(val):
         return None
 
 
+# Margaritaville's PMS exports an "Occupancy Statistics" .xlsx instead of the
+# standard "Business on the Books" CSV every other hotel uses. Rather than
+# add a second code path through build_strategy_change_plan, this parser
+# normalizes it into a DataFrame with the exact same column positions as
+# parse_csv() (0=date, 4=OOO, 7=Grp PU TY, 8=Grp N/PU TY, 9=Grp Rev TY,
+# 15=Trans count, 16=Trans Rev) — mapping confirmed against a real export —
+# so STRATEGY_CSV_COLS and build_strategy_change_plan need no changes at all.
+MARGARITAVILLE_SR_SOURCE_FIELDS = {
+    "ooo rms":      4,   # -> ooo_rms
+    "trans rms":    15,  # -> otb_trans
+    "trans rm rev": 16,  # -> trans_rev_ty
+    "grp pkup rms": 7,   # -> grp_pu_ty
+    "grp rm rev":   9,   # -> grp_rev_ty
+    "grp rem":      8,   # -> grp_npu_ty ("remaining" = not yet picked up)
+}
+
+
+def parse_margaritaville_sr_source(file_bytes: bytes) -> pd.DataFrame:
+    """Parse Margaritaville's 'Occupancy Statistics' PMS export for the SR
+    flow. Detects the header row and field columns by their text labels —
+    never by color; the source file's color-coding was only for human
+    reference while this mapping was being worked out, not something to
+    parse at runtime (this app never uses cell color to find targets).
+    Skips 'History Total' / 'Forecasted Total' / 'Total' summary rows and
+    the trailing filter/timestamp/hotel-name rows at the bottom of the sheet
+    (any row whose date column doesn't parse as a real date).
+    """
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    ws = wb.worksheets[0]
+
+    header_row = None
+    for r in range(1, min(ws.max_row, 30) + 1):
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if isinstance(v, str) and "history/forecasted" in v.strip().lower():
+                header_row = r
+                break
+        if header_row:
+            break
+    if header_row is None:
+        raise ValueError("Could not find the 'History/Forecasted' header row in the source file.")
+
+    col_for_field = {}
+    for c in range(1, ws.max_column + 1):
+        label = str(ws.cell(header_row, c).value or "").strip().lower()
+        for field_label, dest_col in MARGARITAVILLE_SR_SOURCE_FIELDS.items():
+            if label == field_label:
+                col_for_field[dest_col] = c
+    missing = [label for label, dest_col in MARGARITAVILLE_SR_SOURCE_FIELDS.items() if dest_col not in col_for_field]
+    if missing:
+        raise ValueError(f"Could not find expected column(s) in source file: {', '.join(missing)}.")
+
+    rows = []
+    for r in range(header_row + 1, ws.max_row + 1):
+        label = str(ws.cell(r, 1).value or "").strip()
+        if not label or "total" in label.lower():
+            continue
+        date_val = ws.cell(r, 2).value
+        if not isinstance(date_val, str) or not DAILY_RE.match(date_val.strip()):
+            continue
+        row_data = {0: date_val.strip()}
+        for dest_col, src_col in col_for_field.items():
+            row_data[dest_col] = safe_float(ws.cell(r, src_col).value)
+        rows.append(row_data)
+
+    if not rows:
+        raise ValueError("No daily rows found in source file.")
+
+    max_col = max(max(r.keys()) for r in rows)
+    return pd.DataFrame(rows).reindex(columns=range(max_col + 1))
+
+
+def parse_bob_source(uploaded_file) -> pd.DataFrame:
+    """Dispatch on file extension: .csv is the standard Business on the
+    Books export every hotel uses; .xlsx is Margaritaville's differently-
+    formatted PMS export (only wired up for the SR flow so far — ROB/
+    Forecast need their own column mapping once that's worked out)."""
+    file_bytes = uploaded_file.read()
+    if uploaded_file.name.lower().endswith(".xlsx"):
+        return parse_margaritaville_sr_source(file_bytes)
+    return parse_csv(file_bytes)
+
+
 # ── ROB Update ───────────────────────────────────────────────────────────────
 
 ROB_SHEETS = ["wk one", "wk two", "wk three", "wk four", "wk five", "wk six"]
@@ -2938,7 +3021,7 @@ if test_mode:
 
         col_a, col_b = st.columns(2)
         with col_a:
-            csv_file2 = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="str_csv")
+            csv_file2 = st.file_uploader("Upload CSV (Business on the Books)", type=["csv", "xlsx"], key="str_csv")
         with col_b:
             rate_file2 = st.file_uploader("Upload Rates & Restrictions CSV", type=["csv"], key="str_rate")
     
@@ -2968,7 +3051,7 @@ if test_mode:
                 all_changes = []
     
                 if csv_file2:
-                    df2 = parse_csv(csv_file2.read())
+                    df2 = parse_bob_source(csv_file2)
                     all_changes += build_strategy_change_plan(df2, wb2_full, sheet_choice2)
     
                 rate_warnings = []
@@ -3207,7 +3290,7 @@ with st.container(border=True):
     # Keying these to the selected hotel clears any uploaded file the moment you
     # switch hotels — one hotel's BOB/R&R CSV should never carry over and get
     # applied to a different hotel.
-    drive_csv = st.file_uploader("CSV — Business on the Books", type=["csv"], key=f"drive_csv_{hotel_sel}", width=500)
+    drive_csv = st.file_uploader("CSV — Business on the Books", type=["csv", "xlsx"], key=f"drive_csv_{hotel_sel}", width=500)
     drive_rate_csv = None
     if "Strategy Report" in (wb_sels or []):
         drive_rate_csv = st.file_uploader("CSV — Rates & Restrictions", type=["csv"], key=f"drive_rate_csv_{hotel_sel}", width=500)
@@ -3582,7 +3665,7 @@ if test_mode:
     if ready and st.button("Preview Changes", key="drive_preview"):
         try:
             svc     = get_drive_service()
-            df      = parse_csv(drive_csv.read()) if drive_csv else None
+            df      = parse_bob_source(drive_csv) if drive_csv else None
             rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
             st.session_state["drive_plans"]     = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month)
             st.session_state["drive_hotel_sel"] = hotel_sel
@@ -3624,7 +3707,7 @@ else:
     if ready and st.button("Upload Data to Workbooks", key="drive_go", type="primary"):
         try:
             svc     = get_drive_service()
-            df      = parse_csv(drive_csv.read()) if drive_csv else None
+            df      = parse_bob_source(drive_csv) if drive_csv else None
             rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
             with st.spinner("Updating workbooks in Google Drive..."):
                 all_plans       = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month)
