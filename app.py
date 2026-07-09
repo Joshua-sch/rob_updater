@@ -2712,21 +2712,27 @@ def _load_wb_from_drive(svc, hotel_id, hotel_name, wb_type, month_date, data_onl
 # — store them in a small JSON file in Drive instead, using the exact same
 # download/upload plumbing already used for every workbook in this app.
 
-APP_DATA_FOLDER_NAME = "ROB Updater App Data"
+APP_DATA_FOLDER_NAME = "Workbook Updater App Data"
 USERS_FILE_NAME      = "users.json"
 
 
 def _find_app_data_folder(service):
-    """Find the shared App Data folder. Must be created once and shared with
-    the service account, the same way every hotel's Drive folder is."""
-    q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
-         "and name = '%s'") % APP_DATA_FOLDER_NAME
+    """Find the shared App Data folder — matched case-insensitively against
+    APP_DATA_FOLDER_NAME (confirmed real case: exact-match search missed a
+    folder created as 'workbook updater app data', different casing than the
+    original name). Must be created once and shared with the service
+    account, the same way every hotel's Drive folder is — can live anywhere
+    inside a Shared Drive, including nested inside a hotel's folder."""
+    q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     result = service.files().list(
-        q=q, fields="files(id, name)", pageSize=5,
+        q=q, fields="files(id, name)", pageSize=1000,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
     ).execute()
-    files = result.get("files", [])
-    return files[0]["id"] if files else None
+    target = APP_DATA_FOLDER_NAME.strip().lower()
+    for f in result.get("files", []):
+        if f["name"].strip().lower() == target:
+            return f["id"]
+    return None
 
 
 def _find_or_create_users_file(service):
