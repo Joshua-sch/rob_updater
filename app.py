@@ -67,31 +67,41 @@ def safe_float(val):
 
 
 # Margaritaville's PMS exports an "Occupancy Statistics" .xlsx instead of the
-# standard "Business on the Books" CSV every other hotel uses. Rather than
-# add a second code path through build_strategy_change_plan, this parser
-# normalizes it into a DataFrame with the exact same column positions as
-# parse_csv() (0=date, 4=OOO, 7=Grp PU TY, 8=Grp N/PU TY, 9=Grp Rev TY,
-# 15=Trans count, 16=Trans Rev) — mapping confirmed against a real export —
-# so STRATEGY_CSV_COLS and build_strategy_change_plan need no changes at all.
-MARGARITAVILLE_SR_SOURCE_FIELDS = {
-    "ooo rms":      4,   # -> ooo_rms
-    "trans rms":    15,  # -> otb_trans
-    "trans rm rev": 16,  # -> trans_rev_ty
-    "grp pkup rms": 7,   # -> grp_pu_ty
-    "grp rm rev":   9,   # -> grp_rev_ty
-    "grp rem":      8,   # -> grp_npu_ty ("remaining" = not yet picked up)
+# standard "Business on the Books" CSV every other hotel uses. Confirmed the
+# SAME export (same "DATE PRINTED" timestamp, same values) is used for both
+# SR and Forecast, matching how one CSV already feeds ROB/SR/Forecast
+# together for every other hotel — so this is ONE parser covering every
+# field either flow needs, not a separate one per workbook type. It
+# normalizes the export into a DataFrame with the exact same column
+# positions as parse_csv() (0=date, 1=Rms Sold, 4=OOO, 5=Room Revenue,
+# 6=ADR, 7=Grp PU TY, 8=Grp N/PU TY, 9=Grp Rev TY, 15=Trans count,
+# 16=Trans Rev) — mapping confirmed against real exports — so
+# STRATEGY_CSV_COLS / build_strategy_change_plan / build_forecast_change_plan
+# need no changes at all.
+MARGARITAVILLE_SOURCE_FIELDS = {
+    "rms sold":     1,   # -> Forecast Rooms Sold (both future & actual)
+    "ooo rms":      4,   # -> SR ooo_rms
+    "room revenue": 5,   # -> Forecast Revenue (actual/past dates)
+    "adr":          6,   # -> Forecast ADR OTB (future dates)
+    "grp pkup rms": 7,   # -> SR grp_pu_ty
+    "grp rem":      8,   # -> SR grp_npu_ty ("remaining" = not yet picked up)
+    "grp rm rev":   9,   # -> SR grp_rev_ty
+    "trans rms":    15,  # -> SR otb_trans
+    "trans rm rev": 16,  # -> SR trans_rev_ty
 }
 
 
-def parse_margaritaville_sr_source(file_bytes: bytes) -> pd.DataFrame:
-    """Parse Margaritaville's 'Occupancy Statistics' PMS export for the SR
-    flow. Detects the header row and field columns by their text labels —
-    never by color; the source file's color-coding was only for human
-    reference while this mapping was being worked out, not something to
-    parse at runtime (this app never uses cell color to find targets).
-    Skips 'History Total' / 'Forecasted Total' / 'Total' summary rows and
-    the trailing filter/timestamp/hotel-name rows at the bottom of the sheet
-    (any row whose date column doesn't parse as a real date).
+def parse_margaritaville_source(file_bytes: bytes) -> pd.DataFrame:
+    """Parse Margaritaville's 'Occupancy Statistics' PMS export (feeds ROB*/
+    SR/Forecast — see MARGARITAVILLE_SOURCE_FIELDS). Detects the header row
+    and field columns by their text labels — never by color; the source
+    file's color-coding was only for human reference while this mapping was
+    being worked out, not something to parse at runtime (this app never uses
+    cell color to find targets). Skips 'History Total' / 'Forecasted Total' /
+    'Total' summary rows and the trailing filter/timestamp/hotel-name rows at
+    the bottom of the sheet (any row whose date column doesn't parse as a
+    real date).
+    * ROB mapping not wired up yet — pending a small tweak to be confirmed.
     """
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     ws = wb.worksheets[0]
@@ -111,10 +121,10 @@ def parse_margaritaville_sr_source(file_bytes: bytes) -> pd.DataFrame:
     col_for_field = {}
     for c in range(1, ws.max_column + 1):
         label = str(ws.cell(header_row, c).value or "").strip().lower()
-        for field_label, dest_col in MARGARITAVILLE_SR_SOURCE_FIELDS.items():
+        for field_label, dest_col in MARGARITAVILLE_SOURCE_FIELDS.items():
             if label == field_label:
                 col_for_field[dest_col] = c
-    missing = [label for label, dest_col in MARGARITAVILLE_SR_SOURCE_FIELDS.items() if dest_col not in col_for_field]
+    missing = [label for label, dest_col in MARGARITAVILLE_SOURCE_FIELDS.items() if dest_col not in col_for_field]
     if missing:
         raise ValueError(f"Could not find expected column(s) in source file: {', '.join(missing)}.")
 
@@ -141,11 +151,11 @@ def parse_margaritaville_sr_source(file_bytes: bytes) -> pd.DataFrame:
 def parse_bob_source(uploaded_file) -> pd.DataFrame:
     """Dispatch on file extension: .csv is the standard Business on the
     Books export every hotel uses; .xlsx is Margaritaville's differently-
-    formatted PMS export (only wired up for the SR flow so far — ROB/
-    Forecast need their own column mapping once that's worked out)."""
+    formatted PMS export (SR + Forecast wired up so far — ROB needs a small
+    additional tweak once that's confirmed)."""
     file_bytes = uploaded_file.read()
     if uploaded_file.name.lower().endswith(".xlsx"):
-        return parse_margaritaville_sr_source(file_bytes)
+        return parse_margaritaville_source(file_bytes)
     return parse_csv(file_bytes)
 
 
@@ -3108,16 +3118,21 @@ if test_mode:
     with st.expander("Forecast"):
         st.header("Forecast Update")
     
-        fcst_csv     = st.file_uploader("Upload CSV (Business on the Books)", type=["csv"], key="fcst_csv")
-        fcst_xl      = st.file_uploader("Upload Current Month Forecast Workbook (.xlsx)", type=["xlsx"], key="fcst_xl")
+        fcst_csv     = st.file_uploader("Upload CSV (Business on the Books)", type=["csv", "xlsx"], key="fcst_csv")
+        fcst_xl      = st.file_uploader("Upload Current Month Forecast Workbook (.xlsx/.xlsm)", type=["xlsx", "xlsm"], key="fcst_xl")
         st.caption("Weeks 3 & 4 only: also upload next month's forecast workbook.")
-        fcst_xl_next = st.file_uploader("Upload Next Month Forecast Workbook (.xlsx)", type=["xlsx"], key="fcst_xl_next")
+        fcst_xl_next = st.file_uploader("Upload Next Month Forecast Workbook (.xlsx/.xlsm)", type=["xlsx", "xlsm"], key="fcst_xl_next")
     
         if fcst_xl:
             fcst_bytes = fcst_xl.read()
             wb_fcst_peek = openpyxl.load_workbook(io.BytesIO(fcst_bytes), data_only=False)
     
             avail_fcst = [s for s in FORECAST_SHEETS if s in wb_fcst_peek.sheetnames]
+            if not avail_fcst:
+                st.error(f"None of the expected week tabs (FCST-WK1 – FCST-WK9) were found in "
+                         f"this workbook. It has: {', '.join(wb_fcst_peek.sheetnames)}. Make sure "
+                         f"you uploaded the destination Forecast workbook here, not the source "
+                         f"data file.")
             auto_fcst  = first_unhighlighted_forecast_sheet(wb_fcst_peek, avail_fcst) if avail_fcst else None
 
             # A selectbox's `index=` is only honored the first time its `key` is
@@ -3152,12 +3167,10 @@ if test_mode:
                 if auto_next:
                     st.caption(f"Auto-detected next month tab: **{auto_next}**")
     
-            if fcst_csv and st.button("Preview Changes", key="fcst_preview"):
-                csv_bytes = fcst_csv.read()
-    
+            if fcst_csv and fcst_sheet and st.button("Preview Changes", key="fcst_preview"):
                 # Current month workbook
                 wb_fcst_full = openpyxl.load_workbook(io.BytesIO(fcst_bytes), data_only=False)
-                df_fcst = parse_csv(csv_bytes)
+                df_fcst = parse_bob_source(fcst_csv)
                 ws_fcst = wb_fcst_full[fcst_sheet]
                 fcst_changes, fcst_warnings = build_forecast_change_plan(df_fcst, ws_fcst)
     
