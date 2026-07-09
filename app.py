@@ -5,7 +5,6 @@ import io
 import re
 import datetime
 import hashlib
-import hmac
 import json
 import bcrypt
 from google.oauth2 import service_account
@@ -2774,18 +2773,6 @@ def _save_users(service, file_id, users):
 
 st.set_page_config(page_title="Linchris Weekly Tools", layout="wide")
 
-def _current_invite_code(rotate_days: int = 1) -> str:
-    """A 6-character code that changes automatically every `rotate_days` days,
-    derived from a secret in Streamlit secrets — no extra storage needed,
-    since it's the same deterministic value on both the submit side and the
-    admin-display side as long as they're computed on the same day. Shown to
-    the admin on the Admin Settings page; required on the Request Access form
-    so account creation isn't open to anyone who finds the URL.
-    """
-    secret = st.secrets["auth"]["invite_secret"].encode()
-    bucket = str(datetime.date.today().toordinal() // rotate_days)
-    return hmac.new(secret, bucket.encode(), hashlib.sha256).hexdigest()[:6].upper()
-
 
 # ── Login gate ────────────────────────────────────────────────────────────────
 def check_login(username: str, password: str):
@@ -2920,9 +2907,6 @@ def render_admin_settings(svc, users_file_id, users_err):
     if st.button("← Back to app"):
         st.session_state["view"] = "main"
         st.rerun()
-
-    st.info(f"Today's invite code: **{_current_invite_code()}** — give this to anyone you want to "
-            f"create an account. It changes daily; account creation auto-approves once the code matches.")
 
     if users_err:
         st.warning(f"Account requests unavailable: {users_err}")
