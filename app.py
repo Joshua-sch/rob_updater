@@ -1565,6 +1565,7 @@ KNOWN_MULTI_FOLDER_HOTELS = {
     "Provincetown Surfside": ["SURFSIDE"],
     "Hotel 1620":            ["1620", "PLYMOUTH"],
     "Wolfeboro":             ["WOLF"],
+    "Provincetown Harbor Hotel": ["HARBOR"],
 }
 
 
