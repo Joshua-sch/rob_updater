@@ -1576,6 +1576,17 @@ def _strip_dedup_suffix(name):
     return re.sub(r'\s*\(\d+\)\s*$', '', name).strip()
 
 
+def _is_rev_reports_name(name):
+    """True if a folder name denotes a 'Revenue Reports' folder. Confirmed
+    real naming variants include the full phrase and the abbreviation
+    'REV RPTS' (Hotel 1620's convention, e.g. 'G. JUL2018 REV RPTS HOTEL
+    1620') — a plain 'REVENUE REPORTS' in name_upper substring check misses
+    the abbreviated form entirely, which broke both hotel grouping and
+    workbook resolution for that hotel.
+    """
+    return bool(re.search(r'REVENUE REPORTS|REV RPTS', name.upper()))
+
+
 def _extract_hotel_name_from_rev_folder(name):
     """Strip date-ish prefixes and the phrase 'Revenue Reports' from a folder
     name, leaving just the hotel name. Confirmed real naming is inconsistent
@@ -1646,7 +1657,7 @@ def get_hotels_from_drive():
                 known_groups.setdefault(known_match, []).append(folder["id"])
                 continue
 
-            if "REVENUE REPORTS" in name_upper:
+            if _is_rev_reports_name(name):
                 extracted = _extract_hotel_name_from_rev_folder(name)
                 if not extracted:
                     # No hotel name left after stripping the date prefix and
@@ -1678,7 +1689,7 @@ def get_hotels_from_drive():
                 q=child_q, fields="files(name)", pageSize=20,
                 supportsAllDrives=True, includeItemsFromAllDrives=True,
             ).execute()
-            has_rev = any("REVENUE REPORTS" in c["name"].upper() for c in children.get("files", []))
+            has_rev = any(_is_rev_reports_name(c["name"]) for c in children.get("files", []))
             if has_rev:
                 hotels.append((_strip_dedup_suffix(name), folder["id"]))
 
@@ -2563,13 +2574,13 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
         folder that IS already the REVENUE REPORTS level directly (detected
         from its own name). Returns ((file_id, file_name), None) or (None, err).
         """
-        self_is_rev = "REVENUE REPORTS" in single_name.upper()
+        self_is_rev = _is_rev_reports_name(single_name)
         children = _list_subfolders(single_id)
 
         # A: Hotel > MMMYYYY REVENUE REPORTS HOTEL > file
         if not self_is_rev:
             a = next((f for f in children
-                       if "REVENUE REPORTS" in f["name"].upper() and month_kw in f["name"].upper()), None)
+                       if _is_rev_reports_name(f["name"]) and month_kw in f["name"].upper()), None)
             if a:
                 result = _find_file_in(a["id"], a["name"])
                 if result[0]:
@@ -2580,9 +2591,9 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
             rev = {"id": single_id, "name": single_name}
         else:
             rev = next((f for f in children
-                        if "REVENUE REPORTS" in f["name"].upper() and year_kw in f["name"]), None)
+                        if _is_rev_reports_name(f["name"]) and year_kw in f["name"]), None)
             if not rev:
-                rev = next((f for f in children if "REVENUE REPORTS" in f["name"].upper()), None)
+                rev = next((f for f in children if _is_rev_reports_name(f["name"])), None)
         if rev:
             rev_children = children if self_is_rev else _list_subfolders(rev["id"])
             b1 = next((f for f in rev_children if month_kw in f["name"].upper()), None)
@@ -2602,7 +2613,7 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
         # C: Hotel > Year > Month > file  (no REVENUE REPORTS wrapper)
         c_year = next((f for f in children
                        if year_kw in f["name"].upper()
-                       and "REVENUE REPORTS" not in f["name"].upper()), None)
+                       and not _is_rev_reports_name(f["name"])), None)
         if c_year:
             c_month_id, c_month_name = drive_find_folder_by_keyword(
                 service, month_kw, parent_id=c_year["id"])
