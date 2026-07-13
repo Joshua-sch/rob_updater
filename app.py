@@ -2314,6 +2314,26 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     month_id, _ = _find_or_create_month_folder_under_rev(service, rev_id, year_kw, month_kw, target_month, hotel_name)
 
     # ── Find or copy the file ─────────────────────────────────────────────────
+    # Diagnostic: list every file in month_id whose name contains "ROB" —
+    # confirmed real risk this session (Wolfeboro's duplicate-named folders)
+    # that two files with the same display name could sit in the same
+    # folder, with drive_find_file silently picking one while a human
+    # browsing to the file by name lands on the other.
+    dup_check_warnings = []
+    try:
+        dup_q = ("'%s' in parents and trashed = false and name contains 'ROB'") % month_id
+        dup_files = service.files().list(
+            q=dup_q, fields="files(id,name)", pageSize=20,
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
+        ).execute().get("files", [])
+        if len(dup_files) > 1:
+            dup_check_warnings.append(
+                f"Multiple files matching 'ROB' found in the target month folder: "
+                + ", ".join(f"'{f['name']}' (id: {f['id']})" for f in dup_files)
+            )
+    except Exception:
+        pass
+
     existing_id, existing_name = drive_find_file(service, "ROB", month_id)
     is_fresh_copy = False
     if existing_id and "master" not in existing_name.lower():
@@ -2349,7 +2369,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     # an error) and load failures (download/openpyxl exceptions) are now
     # captured into `warnings` and surfaced to the caller alongside the
     # success message, matching the diagnostic the SR flow already shows.
-    warnings = []
+    warnings = [f"Target file id: {new_file_id} (name: {new_file_name})"] + dup_check_warnings
 
     prev_month_dt = (target_month - datetime.timedelta(days=1)).replace(day=1)
     prev_result, prev_err = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB",
