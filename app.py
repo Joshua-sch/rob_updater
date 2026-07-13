@@ -2357,6 +2357,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     prev_wb = None
     prev_wb_formulas = None
     if prev_result:
+        warnings.append(f"Prev month ({prev_month_dt.strftime('%b %Y')}) resolved to: {prev_result[1]}")
         try:
             prev_bytes = drive_download(service, prev_result[0])
             prev_wb = openpyxl.load_workbook(io.BytesIO(prev_bytes), data_only=True)
@@ -2371,6 +2372,7 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
                                                 month_date=ly_month_dt)
     ly_wb = None
     if ly_result:
+        warnings.append(f"Last year ({ly_month_dt.strftime('%b %Y')}) resolved to: {ly_result[1]}")
         try:
             ly_wb = openpyxl.load_workbook(
                 io.BytesIO(drive_download(service, ly_result[0])), data_only=True)
@@ -2402,6 +2404,19 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         ly_ws   = ly_wb[sheet_name]   if ly_wb   and sheet_name in ly_wb.sheetnames   else None
         is_wk_one = (sheet_name == wk_one_name)
         _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_name)
+
+    # Direct readback of the target month's own block in WKONE, right after
+    # the fill loop and before save/upload — confirms whether the in-memory
+    # write actually happened, isolating "fill logic didn't write it" from
+    # "something after this point (save/upload) lost it".
+    if wk_one_name in new_wb.sheetnames:
+        target_idx = target_month.month - 1
+        target_block_start = 4 + 8 * target_idx
+        rev_val = new_wb[wk_one_name].cell(target_block_start + 1, 2).value
+        warnings.append(
+            f"Readback check — {target_month.strftime('%b %Y')} Revenue (WKONE row "
+            f"{target_block_start + 1}, col B) after fill: {rev_val!r}"
+        )
 
     # ── Fill Week 1 Previous Sheet table in wk one ───────────────────────────
     if prev_wb and wk_one_name in new_wb.sheetnames:
