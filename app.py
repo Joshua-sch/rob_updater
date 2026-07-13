@@ -1564,6 +1564,7 @@ KNOWN_MULTI_FOLDER_HOTELS = {
     "Hyannis Anchor In":     ["ANCHOR"],
     "Provincetown Surfside": ["SURFSIDE"],
     "Hotel 1620":            ["1620", "PLYMOUTH"],
+    "Wolfeboro":             ["WOLF"],
 }
 
 
@@ -1824,10 +1825,18 @@ def _find_or_create_month_folder_under_rev(service, rev_id, year_kw, month_kw, t
 
 def drive_find_file(service, keyword, parent_id):
     """Return (file_id, file_name) for first xlsx whose name contains keyword,
-    excluding files whose name also contains 'copy' (to skip backup copies)."""
+    excluding files whose name also contains 'copy' (to skip backup copies).
+
+    Also matches native Google Sheets (mimeType 'application/vnd.google-apps.
+    spreadsheet') — confirmed real case: Hotel 1620's Forecast workbook was
+    created directly as a Google Sheet rather than uploaded as .xlsx, so an
+    xlsx/xlsm-only filter silently missed it even though the name matched.
+    drive_download handles exporting these to xlsx bytes on read.
+    """
     q = ("'%s' in parents and trashed = false "
          "and (mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
-         "or mimeType = 'application/vnd.ms-excel.sheet.macroenabled.12')") % parent_id
+         "or mimeType = 'application/vnd.ms-excel.sheet.macroenabled.12' "
+         "or mimeType = 'application/vnd.google-apps.spreadsheet')") % parent_id
     result = service.files().list(
         q=q, fields="files(id, name)",
         supportsAllDrives=True, includeItemsFromAllDrives=True,
@@ -1843,8 +1852,19 @@ def drive_find_file(service, keyword, parent_id):
 
 
 def drive_download(service, file_id) -> bytes:
+    """Download a file's bytes. Native Google Sheets (created directly in
+    Drive rather than uploaded as .xlsx — confirmed real case: Hotel 1620's
+    Forecast workbook) can't be read via get_media like a normal blob file;
+    they must be exported to xlsx format instead."""
+    meta = service.files().get(fileId=file_id, fields="mimeType", supportsAllDrives=True).execute()
     buf = io.BytesIO()
-    req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    if meta.get("mimeType") == "application/vnd.google-apps.spreadsheet":
+        req = service.files().export_media(
+            fileId=file_id,
+            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
     dl  = MediaIoBaseDownload(buf, req)
     done = False
     while not done:
