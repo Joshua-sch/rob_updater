@@ -1606,8 +1606,9 @@ def _extract_hotel_name_from_rev_folder(name):
     s = re.sub(r'^[A-Za-z]\s*[\.\:\-]\s*', '', s)
     s = re.sub(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*\d{2,4}\s+', '', s, flags=re.IGNORECASE)
     s = re.sub(r'^\d{4}\s+', '', s)
-    s = re.sub(r'revenue\s*reports', '', s, flags=re.IGNORECASE)
-    return re.sub(r'\s+', ' ', s).strip()
+    s = re.sub(r'revenue\s*reports|rev\s+rpts', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s.strip(' -:.,')
 
 
 @st.cache_data(ttl=300)
