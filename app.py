@@ -2711,6 +2711,23 @@ def resolve_drive_workbook(service, hotel_id: str, hotel_name: str, workbook_typ
         from its own name). Returns ((file_id, file_name), None) or (None, err).
         """
         self_is_rev = _is_rev_reports_name(single_name)
+
+        # A0: candidate IS already the month-level folder — its own name
+        # contains both "REVENUE REPORTS" and the target month, so the file
+        # is directly inside it, not further down. Confirmed real case:
+        # Tybee's month folders are individually named "G: JUL2026 REVENUE
+        # REPORTS TYBEE"; because that name also contains "REVENUE REPORTS"
+        # it gets swept into the same MULTI: candidate group as Tybee's root
+        # and year-level folders (get_hotels_from_drive merges by extracted
+        # hotel name, not by structural level). Without this check,
+        # self_is_rev below always assumes further year/month descent is
+        # needed, finds no subfolders (children are files here), and fails
+        # even though this candidate is the correct one.
+        if self_is_rev and month_kw in single_name.upper():
+            result = _find_file_in(single_id, single_name)
+            if result[0]:
+                return result
+
         children = _list_subfolders(single_id)
 
         # A: Hotel > MMMYYYY REVENUE REPORTS HOTEL > file
