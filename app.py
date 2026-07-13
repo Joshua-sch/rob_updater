@@ -2380,6 +2380,18 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         warnings.append(f"Last year ({ly_month_dt.strftime('%b %Y')}) not found — future months' historical "
                          f"columns will be blank: {ly_err}")
 
+    # Sheet lookups below are exact, case-sensitive matches against
+    # ROB_SHEETS ("wk one", "wk two", ...) — a workbook can load successfully
+    # above and still contribute nothing if its own tab names don't match
+    # that exact casing/spacing (e.g. "Wk One", "WK1"). Surface that
+    # mismatch explicitly instead of the fill silently doing nothing.
+    for label, wb_obj in [("Prev month", prev_wb), ("Last year", ly_wb)]:
+        if wb_obj is not None and ROB_SHEETS[0] not in wb_obj.sheetnames:
+            warnings.append(
+                f"{label} workbook loaded but has no '{ROB_SHEETS[0]}' tab — "
+                f"actual tabs: {wb_obj.sheetnames}"
+            )
+
     # ── Fill each sheet ───────────────────────────────────────────────────────
     wk_one_name = ROB_SHEETS[0]
     for sheet_name in ROB_SHEETS:
