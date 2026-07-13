@@ -2343,9 +2343,17 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     if is_fresh_copy:
         clear_tab_colors(new_wb, ROB_SHEETS)
 
+    # Resolution/load failures here used to be swallowed silently — the
+    # ROB workbook would just come back with July onward blank and no
+    # indication why. Both lookup failures (resolve_drive_workbook returning
+    # an error) and load failures (download/openpyxl exceptions) are now
+    # captured into `warnings` and surfaced to the caller alongside the
+    # success message, matching the diagnostic the SR flow already shows.
+    warnings = []
+
     prev_month_dt = (target_month - datetime.timedelta(days=1)).replace(day=1)
-    prev_result, _ = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB",
-                                             month_date=prev_month_dt)
+    prev_result, prev_err = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB",
+                                                     month_date=prev_month_dt)
     prev_wb = None
     prev_wb_formulas = None
     if prev_result:
@@ -2353,19 +2361,24 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
             prev_bytes = drive_download(service, prev_result[0])
             prev_wb = openpyxl.load_workbook(io.BytesIO(prev_bytes), data_only=True)
             prev_wb_formulas = openpyxl.load_workbook(io.BytesIO(prev_bytes), data_only=False)
-        except Exception:
-            pass
+        except Exception as e:
+            warnings.append(f"Prev month ({prev_month_dt.strftime('%b %Y')}) workbook found but failed to load: {e}")
+    else:
+        warnings.append(f"Prev month ({prev_month_dt.strftime('%b %Y')}) not found: {prev_err}")
 
     ly_month_dt = target_month.replace(year=target_month.year - 1)
-    ly_result, _ = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB",
-                                           month_date=ly_month_dt)
+    ly_result, ly_err = resolve_drive_workbook(service, hotel_id, hotel_name, "ROB",
+                                                month_date=ly_month_dt)
     ly_wb = None
     if ly_result:
         try:
             ly_wb = openpyxl.load_workbook(
                 io.BytesIO(drive_download(service, ly_result[0])), data_only=True)
-        except Exception:
-            pass
+        except Exception as e:
+            warnings.append(f"Last year ({ly_month_dt.strftime('%b %Y')}) workbook found but failed to load: {e}")
+    else:
+        warnings.append(f"Last year ({ly_month_dt.strftime('%b %Y')}) not found — future months' historical "
+                         f"columns will be blank: {ly_err}")
 
     # ── Fill each sheet ───────────────────────────────────────────────────────
     wk_one_name = ROB_SHEETS[0]
@@ -2379,7 +2392,6 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_name)
 
     # ── Fill Week 1 Previous Sheet table in wk one ───────────────────────────
-    warnings = []
     if prev_wb and wk_one_name in new_wb.sheetnames:
         err = _fill_rob_prev_table(new_wb[wk_one_name], prev_wb, prev_wb_formulas, target_month)
         if err:
