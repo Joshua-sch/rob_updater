@@ -568,32 +568,46 @@ def detect_date_column(ws):
     date-to-row map was built a year off and almost nothing matched the CSV.
     Breaking ties by which column's dates start closest to today reliably
     picks the current/forward-looking column instead.
+
+    A freshly-set-up month's TY column is typically a literal anchor date
+    followed by '=prevRow+1' formula rows (build_date_row_map already
+    assumes and extrapolates this pattern) — counting only literal
+    isinstance(date) values undercounts it, so a fully-literal LY column
+    can win outright before the tie-break above even applies. Confirmed
+    real case: Provincetown Harbor Hotel's SR — the LY (2025) column was
+    fully literal while TY (2026) was anchor+formulas, so TY never reached
+    the 3-date minimum and was skipped as a candidate entirely, silently
+    picking LY and mapping every row a year behind the CSV's dates.
+    Counting formula rows that follow a literal anchor as continuing the
+    sequence (without evaluating them) fixes this the same way
+    build_date_row_map already trusts that pattern.
     """
-    import collections
     today = datetime.date.today()
-    col_dates = collections.defaultdict(list)
-    for r in range(5, min(ws.max_row + 1, 15)):
-        for c in range(1, 11):
+    best_col, best_consecutive, best_proximity = 3, -1, None  # fallback to col 3
+    for c in range(1, 11):
+        anchor_date = None
+        count = 0
+        for r in range(5, min(ws.max_row + 1, 15)):
             v = ws.cell(r, c).value
             if isinstance(v, datetime.datetime):
-                col_dates[c].append(v.date())
+                d = v.date()
             elif isinstance(v, datetime.date):
-                col_dates[c].append(v)
-
-    best_col, best_consecutive, best_proximity = 3, -1, None  # fallback to col 3
-    for c, dates in col_dates.items():
-        if len(dates) < 3:
+                d = v
+            elif anchor_date is not None and isinstance(v, str) and v.startswith("="):
+                count += 1  # formula row — trust it continues the sequence
+                continue
+            else:
+                continue
+            if anchor_date is None:
+                anchor_date = d
+            count += 1
+        if count < 3 or anchor_date is None:
             continue
-        dates_sorted = sorted(dates)
-        consecutive = sum(
-            1 for i in range(1, len(dates_sorted))
-            if (dates_sorted[i] - dates_sorted[i-1]).days == 1
-        )
-        proximity = abs((dates_sorted[0] - today).days)
-        if consecutive > best_consecutive or (
-            consecutive == best_consecutive and (best_proximity is None or proximity < best_proximity)
+        proximity = abs((anchor_date - today).days)
+        if count > best_consecutive or (
+            count == best_consecutive and (best_proximity is None or proximity < best_proximity)
         ):
-            best_consecutive = consecutive
+            best_consecutive = count
             best_proximity = proximity
             best_col = c
     return best_col
