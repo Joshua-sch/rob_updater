@@ -2405,12 +2405,18 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
     # Sheet lookups below are exact, case-sensitive matches against
     # ROB_SHEETS ("wk one", "wk two", ...) — a workbook can load successfully
     # above and still contribute nothing if its own tab names don't match
-    # that exact casing/spacing (e.g. "Wk One", "WK1"). Surface that
-    # mismatch explicitly instead of the fill silently doing nothing.
+    # that exact casing/spacing (e.g. "Wk One", "WK1"). Checking only "wk
+    # one" previously missed this: a source workbook can have a correctly
+    # named "wk one" (so wk one fills fine) while missing/mismatching "wk
+    # two" through "wk six" — confirmed real case where wk one populated but
+    # wk two silently didn't. Check every ROB_SHEETS name, not just the first.
     for label, wb_obj in [("Prev month", prev_wb), ("Last year", ly_wb)]:
-        if wb_obj is not None and ROB_SHEETS[0] not in wb_obj.sheetnames:
+        if wb_obj is None:
+            continue
+        missing = [s for s in ROB_SHEETS if s not in wb_obj.sheetnames]
+        if missing:
             warnings.append(
-                f"{label} workbook loaded but has no '{ROB_SHEETS[0]}' tab — "
+                f"{label} workbook is missing tabs: {missing} — "
                 f"actual tabs: {wb_obj.sheetnames}"
             )
 
@@ -2425,18 +2431,22 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
         is_wk_one = (sheet_name == wk_one_name)
         _fill_rob_sheet(new_ws, prev_ws, ly_ws, target_month, is_wk_one, wk_one_name)
 
-    # Direct readback of the target month's own block in WKONE, right after
-    # the fill loop and before save/upload — confirms whether the in-memory
-    # write actually happened, isolating "fill logic didn't write it" from
-    # "something after this point (save/upload) lost it".
-    if wk_one_name in new_wb.sheetnames:
-        target_idx = target_month.month - 1
-        target_block_start = 4 + 8 * target_idx
-        rev_val = new_wb[wk_one_name].cell(target_block_start + 1, 2).value
-        warnings.append(
-            f"Readback check — {target_month.strftime('%b %Y')} Revenue (WKONE row "
-            f"{target_block_start + 1}, col B) after fill: {rev_val!r}"
-        )
+    # Direct readback of the target month's own block, right after the fill
+    # loop and before save/upload — confirms whether the in-memory write
+    # actually happened per sheet, isolating "fill logic didn't write it
+    # for this tab" from "something after this point (save/upload) lost
+    # it". Checked across all six week tabs, not just WKONE — confirmed
+    # real case where wk one's fill succeeded but wk two's silently didn't.
+    target_idx = target_month.month - 1
+    target_block_start = 4 + 8 * target_idx
+    readback = {
+        s: new_wb[s].cell(target_block_start + 1, 2).value
+        for s in ROB_SHEETS if s in new_wb.sheetnames
+    }
+    warnings.append(
+        f"Readback check — {target_month.strftime('%b %Y')} Revenue (row "
+        f"{target_block_start + 1}, col B) per tab after fill: {readback!r}"
+    )
 
     # ── Fill Week 1 Previous Sheet table in wk one ───────────────────────────
     if prev_wb and wk_one_name in new_wb.sheetnames:
