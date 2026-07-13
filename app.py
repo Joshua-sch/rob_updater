@@ -1563,7 +1563,7 @@ MULTI_ID_PREFIX = "MULTI:"
 KNOWN_MULTI_FOLDER_HOTELS = {
     "Hyannis Anchor In":     ["ANCHOR"],
     "Provincetown Surfside": ["SURFSIDE"],
-    "Hotel 1620":            ["1620"],
+    "Hotel 1620":            ["1620", "PLYMOUTH"],
 }
 
 
