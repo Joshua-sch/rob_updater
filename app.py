@@ -1944,12 +1944,47 @@ def drive_copy_file(service, source_file_id: str, new_name: str, parent_folder_i
     return copied["id"], copied["name"]
 
 
+def _hotel_search_scope_ids(service, hotel_id):
+    """Return every folder id that could plausibly hold a hotel's MASTER
+    template files: each of the hotel's own root candidate folder(s)
+    (unwrapping a MULTI:<id>,<id>,... group) plus their direct children.
+
+    Confirmed real case: master-file lookups used to search ALL of Drive
+    with no folder scoping at all — Wolfeboro's 'Set Up New ROB' found and
+    copied Hotel 1620's ROB master (Drive's unordered global search just
+    happened to return it first), silently mislabeling the result 'JUL2026
+    ROB PLYMOUTH.xlsx' inside Wolfeboro's own folder.
+    """
+    if hotel_id.startswith(MULTI_ID_PREFIX):
+        root_ids = hotel_id[len(MULTI_ID_PREFIX):].split(",")
+    else:
+        root_ids = [hotel_id]
+
+    scope_ids = list(root_ids)
+    for rid in root_ids:
+        q = ("mimeType = 'application/vnd.google-apps.folder' and trashed = false "
+             "and '%s' in parents") % rid
+        try:
+            children = service.files().list(
+                q=q, fields="files(id)", pageSize=100,
+                supportsAllDrives=True, includeItemsFromAllDrives=True,
+            ).execute().get("files", [])
+        except Exception:
+            children = []
+        scope_ids.extend(c["id"] for c in children)
+    return scope_ids
+
+
 def find_rob_master(service, hotel_id: str):
-    """Search the hotel's Drive tree for the ROB master file."""
-    q = ("trashed=false "
+    """Search the hotel's own Drive tree for the ROB master file."""
+    scope_ids = _hotel_search_scope_ids(service, hotel_id)
+    if not scope_ids:
+        return None, "Could not resolve hotel folder to search."
+    parent_clause = " or ".join("'%s' in parents" % sid for sid in scope_ids)
+    q = ("trashed=false and (%s) "
          "and (mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
          "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12') "
-         "and name contains 'MASTER' and name contains 'ROB'")
+         "and name contains 'MASTER' and name contains 'ROB'") % parent_clause
     result = service.files().list(
         q=q, fields="files(id,name,parents)", pageSize=50,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
@@ -2344,11 +2379,15 @@ def setup_new_rob_month(service, hotel_id: str, hotel_name: str, target_month: d
 
 
 def find_forecast_master(service, hotel_id: str):
-    """Search the hotel's Drive tree for the Forecast master file (.xlsx or .xlsm)."""
-    q = ("trashed=false "
+    """Search the hotel's own Drive tree for the Forecast master file (.xlsx or .xlsm)."""
+    scope_ids = _hotel_search_scope_ids(service, hotel_id)
+    if not scope_ids:
+        return None, "Could not resolve hotel folder to search."
+    parent_clause = " or ".join("'%s' in parents" % sid for sid in scope_ids)
+    q = ("trashed=false and (%s) "
          "and (mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
          "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12') "
-         "and name contains 'MASTER' and name contains 'FORECAST'")
+         "and name contains 'MASTER' and name contains 'FORECAST'") % parent_clause
     result = service.files().list(
         q=q, fields="files(id,name,parents)", pageSize=50,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
@@ -2430,18 +2469,20 @@ def setup_new_forecast_month(service, hotel_id: str, hotel_name: str, target_mon
 
 
 def find_sr_master(service, hotel_id: str):
-    """Search the hotel's REVENUE REPORTS tree for the SR master file.
+    """Search the hotel's own Drive tree for the SR master file.
     Returns (file_id, file_name) or (None, error_str).
     """
-    rev_id, rev_name = drive_find_folder_by_keyword(service, "REVENUE REPORTS", parent_id=hotel_id)
-    if not rev_id:
-        return None, "No REVENUE REPORTS folder found."
-
-    # Search all subfolders for a file with MASTER and STRATEGY in the name
-    q = ("trashed=false "
+    scope_ids = _hotel_search_scope_ids(service, hotel_id)
+    if not scope_ids:
+        return None, "Could not resolve hotel folder to search."
+    parent_clause = " or ".join("'%s' in parents" % sid for sid in scope_ids)
+    q = ("trashed=false and (%s) "
          "and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
-         "and name contains 'MASTER' and name contains 'STRATEGY'")
-    result = service.files().list(q=q, fields="files(id,name,parents)", pageSize=50).execute()
+         "and name contains 'MASTER' and name contains 'STRATEGY'") % parent_clause
+    result = service.files().list(
+        q=q, fields="files(id,name,parents)", pageSize=50,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
     for f in result.get("files", []):
         return f["id"], f["name"]
     return None, "No STRATEGY master file found in Drive."
