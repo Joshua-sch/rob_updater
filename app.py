@@ -1580,6 +1580,7 @@ KNOWN_MULTI_FOLDER_HOTELS = {
     "Hotel 1620":            ["1620", "PLYMOUTH"],
     "Wolfeboro":             ["WOLF"],
     "Provincetown Harbor Hotel": ["HARBOR"],
+    "Provincetown Brass Key":    ["BRASS"],
 }
 
 
