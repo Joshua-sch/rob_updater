@@ -2992,7 +2992,7 @@ if LOGIN_ENABLED and not st.session_state["authenticated"]:
     st.title("Linchris Hotel Corporation")
     st.subheader("Please log in to continue")
 
-    login_tab, access_key_tab = st.tabs(["Log In", "Access Key"])
+    login_tab, request_tab = st.tabs(["Log In", "Request Access"])
 
     with login_tab:
         with st.form("login_form"):
@@ -3009,32 +3009,47 @@ if LOGIN_ENABLED and not st.session_state["authenticated"]:
                 else:
                     st.error("Incorrect username or password — or your account is still pending admin approval.")
 
-    with access_key_tab:
-        # Temporary, simple stopgap: a single shared secret (Streamlit
-        # secrets, no Drive/storage involved) grants standard access —
-        # no per-person account, no folder setup. Fine for onboarding a
-        # handful of people quickly; can be replaced with a real per-person
-        # account system (already built once, just dormant — see
-        # _find_or_create_users_file / render_admin_settings) later.
-        st.caption("Enter the access key given to you by an admin to get in.")
-        with st.form("access_key_form"):
-            access_key_input = st.text_input("Access key", type="password", key="access_key_input")
-            display_name     = st.text_input("Your name", key="access_key_display_name")
-            key_submitted     = st.form_submit_button("Enter")
-            if key_submitted:
-                configured_key = st.secrets.get("auth", {}).get("access_key")
-                if not configured_key:
-                    st.error("Access key login isn't set up yet — an admin needs to add "
-                             "'access_key' under [auth] in this app's secrets.")
-                elif not access_key_input:
-                    st.error("Access key is required.")
-                elif access_key_input.strip() != configured_key:
-                    st.error("Incorrect access key.")
+    with request_tab:
+        st.caption("Create your own login. An admin needs to approve it before you can log in.")
+        with st.form("request_access_form"):
+            req_username     = st.text_input("Choose a username", key="req_username")
+            req_display_name = st.text_input("Your name", key="req_display_name")
+            req_password     = st.text_input("Choose a password", type="password", key="req_password")
+            req_confirm      = st.text_input("Confirm password", type="password", key="req_confirm")
+            req_submitted    = st.form_submit_button("Request Access")
+            if req_submitted:
+                admin_user = st.secrets["auth"]["username"]
+                uname = req_username.strip()
+                if not uname or not req_password:
+                    st.error("Username and password are required.")
+                elif req_password != req_confirm:
+                    st.error("Passwords don't match.")
+                elif uname.lower() == admin_user.lower():
+                    st.error("That username is taken.")
                 else:
-                    st.session_state["authenticated"] = True
-                    st.session_state["is_admin"] = False
-                    st.session_state["username"] = display_name.strip() or "Guest"
-                    st.rerun()
+                    try:
+                        svc = get_drive_service()
+                        file_id, err = _find_or_create_users_file(svc)
+                        if err:
+                            st.error(err)
+                        else:
+                            existing_users = _load_users(svc, file_id)
+                            if any(u.get("username", "").lower() == uname.lower() for u in existing_users):
+                                st.error("That username is already taken or pending approval.")
+                            else:
+                                existing_users.append({
+                                    "username":      uname,
+                                    "display_name":  req_display_name.strip(),
+                                    "password_hash": bcrypt.hashpw(req_password.encode(), bcrypt.gensalt()).decode(),
+                                    "status":        "pending",
+                                    "role":          "editor",
+                                    "requested_at":  datetime.datetime.now().isoformat(),
+                                    "decided_at":    None,
+                                })
+                                _save_users(svc, file_id, existing_users)
+                                st.success("Request submitted — an admin needs to approve it before you can log in.")
+                    except Exception as e:
+                        st.error(f"Could not submit request: {e}")
 
     st.stop()
 
