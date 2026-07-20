@@ -794,6 +794,25 @@ def build_date_row_map(wb, prefer_sheet=None):
                 anchor_row  = row_num
             mapping[d] = row_num
         if mapping:
+            # Auto-correct a stale year instead of requiring the sheet's
+            # own cells to be manually fixed every cycle — confirmed real
+            # case: Harbor Hotel's WKONE date column was genuinely stuck at
+            # 2025 (never advanced when the year rolled to 2026). If the
+            # detected column's anchor year doesn't match the current year,
+            # shift every mapped date forward by that many years. A
+            # correctly-dated column's anchor is already close to today
+            # (that's what detect_date_column's proximity scoring picks
+            # for), so this is a no-op in the normal case.
+            year_shift = datetime.date.today().year - anchor_date.year
+            if year_shift != 0:
+                shifted = {}
+                for d, r in mapping.items():
+                    try:
+                        shifted[d.replace(year=d.year + year_shift)] = r
+                    except ValueError:
+                        # Feb 29 with no Feb 29 in the shifted year
+                        shifted[d.replace(month=2, day=28, year=d.year + year_shift)] = r
+                mapping = shifted
             return mapping
     return {}
 
