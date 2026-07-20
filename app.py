@@ -747,33 +747,48 @@ def get_ly_sr_data(service, hotel_id, hotel_name, current_month, sheet_name):
     return out
 
 
-def build_date_row_map(wb):
-    """Build {date: row_number} from WKONE using auto-detected date column.
-    When subsequent rows contain formulas (=C5+1 style), extrapolates from the
-    first real date so the full year is mapped correctly.
+def build_date_row_map(wb, prefer_sheet=None):
+    """Build {date: row_number} using auto-detected date column, trying
+    prefer_sheet (the tab actually being updated) first and falling back to
+    WKONE. When subsequent rows contain formulas (=C5+1 style), extrapolates
+    from the first real date so the full year is mapped correctly.
+
+    Confirmed real case: Provincetown Harbor Hotel's WKONE date column was
+    stuck a year behind (2024/2025) while WKFOUR — the sheet actually being
+    updated — had its own correct, independently populated 2025/2026
+    column. Always reading WKONE broke every week's update, even weeks
+    whose own calendar was perfectly fine, because their own date column
+    was never even looked at.
     """
-    ws = wb["WKONE"]
-    date_col = detect_date_column(ws)
-    mapping = {}
-    anchor_date = None
-    anchor_row  = None
-    for row_num in range(5, ws.max_row + 1):
-        val = ws.cell(row_num, date_col).value
-        if isinstance(val, datetime.datetime):
-            d = val.date()
-        elif isinstance(val, datetime.date):
-            d = val
-        elif anchor_date and isinstance(val, str) and val.startswith("="):
-            # Formula row — extrapolate from anchor
-            offset = row_num - anchor_row
-            d = anchor_date + datetime.timedelta(days=offset)
-        else:
-            continue
-        if anchor_date is None:
-            anchor_date = d
-            anchor_row  = row_num
-        mapping[d] = row_num
-    return mapping
+    candidates = [prefer_sheet] if prefer_sheet and prefer_sheet in wb.sheetnames else []
+    if "WKONE" in wb.sheetnames:
+        candidates.append("WKONE")
+
+    for sheet_name in candidates:
+        ws = wb[sheet_name]
+        date_col = detect_date_column(ws)
+        mapping = {}
+        anchor_date = None
+        anchor_row  = None
+        for row_num in range(5, ws.max_row + 1):
+            val = ws.cell(row_num, date_col).value
+            if isinstance(val, datetime.datetime):
+                d = val.date()
+            elif isinstance(val, datetime.date):
+                d = val
+            elif anchor_date and isinstance(val, str) and val.startswith("="):
+                # Formula row — extrapolate from anchor
+                offset = row_num - anchor_row
+                d = anchor_date + datetime.timedelta(days=offset)
+            else:
+                continue
+            if anchor_date is None:
+                anchor_date = d
+                anchor_row  = row_num
+            mapping[d] = row_num
+        if mapping:
+            return mapping
+    return {}
 
 
 def find_otb_date_cell(ws):
@@ -804,7 +819,7 @@ def _extract_otb_trans_by_date(wb, sheet_name, from_date):
     otb_col = col_map.get("otb_trans")
     if not otb_col:
         return {}
-    date_row_map = build_date_row_map(wb)  # reads WKONE, handles formula dates
+    date_row_map = build_date_row_map(wb, prefer_sheet=sheet_name)
     out = {}
     for d, r in date_row_map.items():
         if d < from_date:
@@ -863,7 +878,7 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
     if scope_end is None:
         scope_end = datetime.date(today.year + 1, 12, 31)
 
-    date_row_map = build_date_row_map(wb)
+    date_row_map = build_date_row_map(wb, prefer_sheet=sheet_name)
     ws = wb[sheet_name]
 
     # Detect actual column positions from headers — no guessing
@@ -1118,7 +1133,7 @@ def build_rates_change_plan(rate_df, wb, sheet_name):
     scope_start = prev_month_start
     scope_end = datetime.date(today.year, 12, 31)
 
-    date_row_map = build_date_row_map(wb)
+    date_row_map = build_date_row_map(wb, prefer_sheet=sheet_name)
     ws = wb[sheet_name]
 
     restric_col = find_restrictions_col(ws)
@@ -3834,7 +3849,7 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
             avail    = [s for s in STRATEGY_SHEETS if s in wb.sheetnames]
             auto     = first_undone_strategy_sheet(wb, avail)
             sheet    = auto or avail[0]
-            date_row_map_debug = build_date_row_map(wb)
+            date_row_map_debug = build_date_row_map(wb, prefer_sheet=sheet)
             st.info(f"SR: **{file_name}** → sheet **{sheet}** | "
                     f"date rows mapped: {len(date_row_map_debug)} | "
                     f"date range: {min(date_row_map_debug) if date_row_map_debug else 'none'} – {max(date_row_map_debug) if date_row_map_debug else 'none'}")
