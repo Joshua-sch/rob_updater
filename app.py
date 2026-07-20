@@ -585,29 +585,39 @@ def detect_date_column(ws):
     today = datetime.date.today()
     best_col, best_consecutive, best_proximity = 3, -1, None  # fallback to col 3
     for c in range(1, 11):
-        anchor_date = None
+        anchor_date = None   # first date of the longest verified-consecutive run
+        last_date   = None   # most recently confirmed date in the current run
         count = 0
+        best_run = 0
+        run_anchor = None
         for r in range(5, min(ws.max_row + 1, 15)):
             v = ws.cell(r, c).value
             if isinstance(v, datetime.datetime):
                 d = v.date()
             elif isinstance(v, datetime.date):
                 d = v
-            elif anchor_date is not None and isinstance(v, str) and v.startswith("="):
-                count += 1  # formula row — trust it continues the sequence
-                continue
+            elif last_date is not None and isinstance(v, str) and v.startswith("="):
+                d = last_date + datetime.timedelta(days=1)  # trust it continues, matching build_date_row_map
             else:
+                last_date = None  # non-date cell — any run in progress is broken
                 continue
-            if anchor_date is None:
-                anchor_date = d
-            count += 1
-        if count < 3 or anchor_date is None:
+
+            if last_date is not None and (d - last_date).days == 1:
+                count += 1
+            else:
+                run_anchor = d  # gap or scattered date — start a fresh run here
+                count = 1
+            last_date = d
+            if count > best_run:
+                best_run = count
+                anchor_date = run_anchor
+        if best_run < 3 or anchor_date is None:
             continue
         proximity = abs((anchor_date - today).days)
-        if count > best_consecutive or (
-            count == best_consecutive and (best_proximity is None or proximity < best_proximity)
+        if best_run > best_consecutive or (
+            best_run == best_consecutive and (best_proximity is None or proximity < best_proximity)
         ):
-            best_consecutive = count
+            best_consecutive = best_run
             best_proximity = proximity
             best_col = c
     return best_col
