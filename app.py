@@ -3860,6 +3860,14 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
             st.info(f"SR: **{file_name}** (id: `{file_id}`) → sheet **{sheet}** | "
                     f"date rows mapped: {len(date_row_map_debug)} | "
                     f"date range: {min(date_row_map_debug) if date_row_map_debug else 'none'} – {max(date_row_map_debug) if date_row_map_debug else 'none'}")
+            if "WKONE" in wb.sheetnames:
+                from openpyxl.utils import get_column_letter
+                wkone_ws = wb["WKONE"]
+                wkone_col = detect_date_column(wkone_ws)
+                raw_r5  = wkone_ws.cell(5, wkone_col).value
+                raw_r10 = wkone_ws.cell(10, wkone_col).value
+                st.info(f"WKONE date column detected: **{get_column_letter(wkone_col)}** | "
+                        f"raw value at row 5: `{raw_r5!r}` | raw value at row 10: `{raw_r10!r}`")
             if df is not None:
                 sample_dates = [str(df.iloc[i, 0]) for i in range(min(5, len(df)))]
                 bob_daily = sum(1 for _, r in df.iterrows() if classify_row(str(r[0]).strip())[0] == "daily")
