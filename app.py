@@ -3850,7 +3850,7 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
             auto     = first_undone_strategy_sheet(wb, avail)
             sheet    = auto or avail[0]
             date_row_map_debug = build_date_row_map(wb, prefer_sheet=sheet)
-            st.info(f"SR: **{file_name}** → sheet **{sheet}** | "
+            st.info(f"SR: **{file_name}** (id: `{file_id}`) → sheet **{sheet}** | "
                     f"date rows mapped: {len(date_row_map_debug)} | "
                     f"date range: {min(date_row_map_debug) if date_row_map_debug else 'none'} – {max(date_row_map_debug) if date_row_map_debug else 'none'}")
             if df is not None:
