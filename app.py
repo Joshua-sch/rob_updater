@@ -557,8 +557,15 @@ def detect_strategy_columns(ws):
         found = None
         for r3_kw, r4_kw in patterns:
             for c, (r3v, r4v) in headers.items():
-                r3_ok = r3_kw is None or _kw_matches(r3v, r3_kw, r3v, r4v)
-                r4_ok = r4_kw is None or _kw_matches(r4v, r4_kw, r3v, r4v)
+                # Match each keyword against the combined row3+row4 text,
+                # not just its "own" row — confirmed real case: a header
+                # like "OTB TY TRANS" doesn't always split the same way
+                # across the two rows on every sheet (e.g. "OTB" / "TY
+                # TRANS" instead of "OTB TY" / "TRANS"), and a strict
+                # own-row-only check missed it entirely.
+                combined = f"{r3v} {r4v}"
+                r3_ok = r3_kw is None or _kw_matches(combined, r3_kw, r3v, r4v)
+                r4_ok = r4_kw is None or _kw_matches(combined, r4_kw, r3v, r4v)
                 if r3_ok and r4_ok and (r3_kw or r4_kw):
                     found = c
                     break
