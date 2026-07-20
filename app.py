@@ -403,7 +403,16 @@ def first_unhighlighted_forecast_sheet(wb, sheet_names):
         if not rows:
             return name  # can't verify — treat as available rather than guess
         otb_row = rows["otb_rooms_row"]
-        has_data = any(isinstance(ws.cell(otb_row, c).value, (int, float)) for c in range(2, 10))
+        # Check the actual date-mapped columns for this sheet rather than a
+        # hardcoded 2-9 range — confirmed real case (Tybee): a filled week
+        # got silently treated as available and overwritten, most likely
+        # because its real data sat outside that fixed range. Falls back to
+        # the old range if the date row itself can't be read. safe_float
+        # (not a strict isinstance check) also catches numbers stored as
+        # text, which a strict int/float check would miss entirely.
+        col_map = build_forecast_date_col_map(ws, ws.parent, date_row=rows["date_row"])
+        data_cols = col_map.values() if col_map else range(2, 10)
+        has_data = any(safe_float(ws.cell(otb_row, c).value) is not None for c in data_cols)
         if has_data:
             continue
         return name
