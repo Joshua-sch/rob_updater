@@ -133,9 +133,17 @@ def parse_margaritaville_source(file_bytes: bytes) -> pd.DataFrame:
         if not label or "total" in label.lower():
             continue
         date_val = ws.cell(r, 2).value
-        if not isinstance(date_val, str) or not DAILY_RE.match(date_val.strip()):
+        # The top data row is sometimes frozen/pinned in Margaritaville's
+        # source (confirmed real case) and can retain a native Excel date
+        # value there while every other row's date is plain text — a
+        # str-only check silently dropped that one row every time.
+        if isinstance(date_val, (datetime.datetime, datetime.date)):
+            date_str = date_val.strftime("%m/%d/%Y")
+        elif isinstance(date_val, str) and DAILY_RE.match(date_val.strip()):
+            date_str = date_val.strip()
+        else:
             continue
-        row_data = {0: date_val.strip()}
+        row_data = {0: date_str}
         for dest_col, src_col in col_for_field.items():
             row_data[dest_col] = safe_float(ws.cell(r, src_col).value)
         rows.append(row_data)
