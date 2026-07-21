@@ -842,7 +842,16 @@ def build_date_row_map(wb, prefer_sheet=None, fallback_to_wkone=True):
         date_col = detect_date_column(ws, wb=wb)
         mapping = {}
         anchor_date = None
-        for row_num in range(5, ws.max_row + 1):
+        # Scan at least 400 rows regardless of this sheet's own max_row —
+        # confirmed real case: a week tab whose date column is entirely
+        # cross-sheet formulas referencing WKONE can have its own "used
+        # range" end far short of WKONE's actual full-year extent (e.g. if
+        # the formulas were only ever dragged down ~33 rows), truncating
+        # every month after that even though WKONE and the CSV both cover
+        # the full year. Reading past a sheet's real content just returns
+        # blank cells (openpyxl doesn't error), so this is always safe.
+        scan_end = max(ws.max_row, 400)
+        for row_num in range(5, scan_end + 1):
             val = ws.cell(row_num, date_col).value
             if isinstance(val, datetime.datetime):
                 d = val.date()
@@ -3959,6 +3968,15 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
                 raw_r10 = wkone_ws.cell(10, wkone_col).value
                 st.info(f"WKONE date column detected: **{get_column_letter(wkone_col)}** | "
                         f"raw value at row 5: `{raw_r5!r}` | raw value at row 10: `{raw_r10!r}`")
+                # Column C specifically — the active sheet's date formulas
+                # reference WKONE!C directly, which may not be the same
+                # column detect_date_column just picked as WKONE's own
+                # "best" column above. Need this exact value to settle
+                # whether the remaining offset originates in WKONE's own
+                # column C data, not wherever else WKONE's calendar lives.
+                raw_c5  = wkone_ws.cell(5, 3).value
+                raw_c6  = wkone_ws.cell(6, 3).value
+                st.info(f"WKONE column C specifically — raw row 5: `{raw_c5!r}` | raw row 6: `{raw_c6!r}`")
             # Strict, no-fallback view of the ACTIVE sheet's own date column —
             # this is what actually gates whether CSV data can be written at
             # all (own_date_row_map inside build_strategy_change_plan uses
