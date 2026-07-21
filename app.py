@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import openpyxl
+from openpyxl.utils import column_index_from_string
 import io
 import re
 import datetime
@@ -579,7 +580,63 @@ def detect_strategy_columns(ws):
     return col_map
 
 
-def detect_date_column(ws):
+_CROSS_SHEET_REF_RE = re.compile(r"^=(?:'([^']+)'|([A-Za-z0-9_]+))!\$?([A-Z]+)\$?(\d+)$")
+_LOCAL_OFFSET_RE    = re.compile(r"^=\$?([A-Z]+)\$?(\d+)([+-]\d+)$")
+
+
+def _resolve_formula_date(wb, sheet_name, formula, _depth=0):
+    """Resolve a date-continuation formula to an actual date without a real
+    spreadsheet engine — handles the two real patterns this app's SR
+    templates use: a cross-sheet single-cell reference (e.g. '=WKONE!C5',
+    used by every non-WKONE week tab to mirror WKONE's own calendar
+    column — the same "other weeks reference wk one" pattern ROB uses) and
+    a local same-column +N day increment (e.g. '=C5+1'). Recurses through
+    a chain (a local offset can itself point at a cross-sheet ref and vice
+    versa) with a depth cap as a cycle guard. Confirmed real case:
+    Provincetown Crowne Pointe's WKTHREE date column is 100% cross-sheet
+    references with no literal cell of its own anywhere — a resolver that
+    only trusted local '=prevRow+1' chains, requiring a literal anchor
+    first, could never resolve a single date from it and always came back
+    empty, blocking all CSV data from being written.
+    """
+    if _depth > 20 or not isinstance(formula, str) or not formula.startswith("="):
+        return None
+    formula = formula.strip()
+
+    m = _CROSS_SHEET_REF_RE.match(formula)
+    if m:
+        target_sheet = m.group(1) or m.group(2)
+        if target_sheet not in wb.sheetnames:
+            return None
+        col_num = column_index_from_string(m.group(3))
+        row_num = int(m.group(4))
+        val = wb[target_sheet].cell(row_num, col_num).value
+        if isinstance(val, datetime.datetime):
+            return val.date()
+        if isinstance(val, datetime.date):
+            return val
+        return _resolve_formula_date(wb, target_sheet, val, _depth + 1)
+
+    m = _LOCAL_OFFSET_RE.match(formula)
+    if m:
+        col_num = column_index_from_string(m.group(1))
+        row_num = int(m.group(2))
+        offset  = int(m.group(3))
+        val = wb[sheet_name].cell(row_num, col_num).value
+        if isinstance(val, datetime.datetime):
+            base = val.date()
+        elif isinstance(val, datetime.date):
+            base = val
+        else:
+            base = _resolve_formula_date(wb, sheet_name, val, _depth + 1)
+            if base is None:
+                return None
+        return base + datetime.timedelta(days=offset)
+
+    return None
+
+
+def detect_date_column(ws, wb=None):
     """Find the column whose data rows (5+) contain the earliest daily dates —
     i.e. the column that maps to each row's actual calendar date.
     Scans cols 1-10 only (dates are always on the left side).
@@ -593,18 +650,10 @@ def detect_date_column(ws):
     Breaking ties by which column's dates start closest to today reliably
     picks the current/forward-looking column instead.
 
-    A freshly-set-up month's TY column is typically a literal anchor date
-    followed by '=prevRow+1' formula rows (build_date_row_map already
-    assumes and extrapolates this pattern) — counting only literal
-    isinstance(date) values undercounts it, so a fully-literal LY column
-    can win outright before the tie-break above even applies. Confirmed
-    real case: Provincetown Harbor Hotel's SR — the LY (2025) column was
-    fully literal while TY (2026) was anchor+formulas, so TY never reached
-    the 3-date minimum and was skipped as a candidate entirely, silently
-    picking LY and mapping every row a year behind the CSV's dates.
-    Counting formula rows that follow a literal anchor as continuing the
-    sequence (without evaluating them) fixes this the same way
-    build_date_row_map already trusts that pattern.
+    Formula cells are resolved via _resolve_formula_date (handles both
+    local +N increments and cross-sheet references like '=WKONE!C5') when
+    wb is provided, instead of just being ignored or blindly assumed to
+    continue by exactly 1 day.
 
     Scans 60 rows (not just the first 10) — a 10-row window is too easily
     fooled by a sheet whose real calendar column doesn't fully establish
@@ -614,6 +663,7 @@ def detect_date_column(ws):
     length before scoring, at negligible extra cost.
     """
     today = datetime.date.today()
+    sheet_name = ws.title
     best_col, best_consecutive, best_proximity = 3, -1, None  # fallback to col 3
     for c in range(1, 11):
         anchor_date = None   # first date of the longest verified-consecutive run
@@ -627,8 +677,11 @@ def detect_date_column(ws):
                 d = v.date()
             elif isinstance(v, datetime.date):
                 d = v
-            elif last_date is not None and isinstance(v, str) and v.startswith("="):
-                d = last_date + datetime.timedelta(days=1)  # trust it continues, matching build_date_row_map
+            elif isinstance(v, str) and v.startswith("=") and wb is not None:
+                d = _resolve_formula_date(wb, sheet_name, v)
+                if d is None:
+                    last_date = None
+                    continue
             else:
                 last_date = None  # non-date cell — any run in progress is broken
                 continue
@@ -722,7 +775,7 @@ def get_ly_sr_data(service, hotel_id, hotel_name, current_month, sheet_name):
 
     ly_ws = ly_wb[sheet_name]
     ly_col_map  = detect_strategy_columns(ly_ws)
-    ly_date_col = detect_date_column(ly_ws)
+    ly_date_col = detect_date_column(ly_ws, wb=ly_wb)
 
     # Build date→row for last year's sheet
     ly_date_row = {}
@@ -786,25 +839,27 @@ def build_date_row_map(wb, prefer_sheet=None, fallback_to_wkone=True):
 
     for sheet_name in candidates:
         ws = wb[sheet_name]
-        date_col = detect_date_column(ws)
+        date_col = detect_date_column(ws, wb=wb)
         mapping = {}
         anchor_date = None
-        anchor_row  = None
         for row_num in range(5, ws.max_row + 1):
             val = ws.cell(row_num, date_col).value
             if isinstance(val, datetime.datetime):
                 d = val.date()
             elif isinstance(val, datetime.date):
                 d = val
-            elif anchor_date and isinstance(val, str) and val.startswith("="):
-                # Formula row — extrapolate from anchor
-                offset = row_num - anchor_row
-                d = anchor_date + datetime.timedelta(days=offset)
+            elif isinstance(val, str) and val.startswith("="):
+                # Resolves both local +N increments and cross-sheet
+                # references (e.g. '=WKONE!C5') — non-WKONE week tabs
+                # mirror WKONE's calendar this way by design, so this must
+                # actually follow the reference, not just assume +1 day.
+                d = _resolve_formula_date(wb, sheet_name, val)
+                if d is None:
+                    continue
             else:
                 continue
             if anchor_date is None:
                 anchor_date = d
-                anchor_row  = row_num
             mapping[d] = row_num
         if mapping:
             # Auto-correct a stale year instead of requiring the sheet's
@@ -877,7 +932,7 @@ def _extract_ly_data_from_wb(ly_wb, sheet_name):
         return {}
     ws = ly_wb[sheet_name]
     col_map  = detect_strategy_columns(ws)
-    date_col = detect_date_column(ws)
+    date_col = detect_date_column(ws, wb=ly_wb)
     comp_ty_col, _ = detect_comp_set_columns(ws, col_map)
 
     out = {}
@@ -2737,7 +2792,7 @@ def get_prev_month_otb_trans(service, hotel_id: str, hotel_name: str, current_mo
     ws = wb[last_filled_sheet]
     col_map = detect_strategy_columns(ws)
     otb_col = col_map.get("otb_trans")
-    date_col = detect_date_column(ws)
+    date_col = detect_date_column(ws, wb=wb)
     if not otb_col:
         return {}
 
@@ -3899,7 +3954,7 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
             if "WKONE" in wb.sheetnames:
                 from openpyxl.utils import get_column_letter
                 wkone_ws = wb["WKONE"]
-                wkone_col = detect_date_column(wkone_ws)
+                wkone_col = detect_date_column(wkone_ws, wb=wb)
                 raw_r5  = wkone_ws.cell(5, wkone_col).value
                 raw_r10 = wkone_ws.cell(10, wkone_col).value
                 st.info(f"WKONE date column detected: **{get_column_letter(wkone_col)}** | "
@@ -3911,7 +3966,7 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
             # one run's output settles both "wrong day" and "no data" at once
             # instead of needing another round of screenshots.
             own_debug = build_date_row_map(wb, prefer_sheet=sheet, fallback_to_wkone=False)
-            own_col = detect_date_column(wb[sheet])
+            own_col = detect_date_column(wb[sheet], wb=wb)
             from openpyxl.utils import get_column_letter as _gcl
             st.info(f"**{sheet}**'s own date column (strict, no WKONE fallback): "
                     f"col **{_gcl(own_col)}** | rows mapped: {len(own_debug)} | "
