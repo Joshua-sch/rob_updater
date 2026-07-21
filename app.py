@@ -650,6 +650,21 @@ def detect_date_column(ws, wb=None):
     Breaking ties by which column's dates start closest to today reliably
     picks the current/forward-looking column instead.
 
+    That "closest to today" tie-break only works when candidates are
+    genuinely a year or more apart — it breaks down when two candidates are
+    just a day or two apart (which happens when a sheet has more than one
+    plausible calendar column, e.g. one mislabeled/off by a day), because
+    whichever one starts *later* will almost always look "closer to today"
+    and win even when it's the wrong one. Confirmed real case: Provincetown
+    Crowne Pointe's WKTHREE mirrors two of WKONE's columns via cross-sheet
+    formula — one starting the 2nd (genuinely wrong data in WKONE itself),
+    one starting the 1st (correct) — and pure proximity picked the 2nd on
+    almost every day of the month. This app's own convention
+    (restructure_sr_dates) always starts a TY column on day 1 of the
+    target month, so preferring a candidate that starts on the 1st is a
+    more reliable tie-break than raw proximity, checked before falling
+    back to proximity for the remaining genuine (same-day-of-month) ties.
+
     Formula cells are resolved via _resolve_formula_date (handles both
     local +N increments and cross-sheet references like '=WKONE!C5') when
     wb is provided, instead of just being ignored or blindly assumed to
@@ -664,7 +679,7 @@ def detect_date_column(ws, wb=None):
     """
     today = datetime.date.today()
     sheet_name = ws.title
-    best_col, best_consecutive, best_proximity = 3, -1, None  # fallback to col 3
+    best_col, best_key = 3, None  # fallback to col 3
     for c in range(1, 11):
         anchor_date = None   # first date of the longest verified-consecutive run
         last_date   = None   # most recently confirmed date in the current run
@@ -697,12 +712,11 @@ def detect_date_column(ws, wb=None):
                 anchor_date = run_anchor
         if best_run < 3 or anchor_date is None:
             continue
-        proximity = abs((anchor_date - today).days)
-        if best_run > best_consecutive or (
-            best_run == best_consecutive and (best_proximity is None or proximity < best_proximity)
-        ):
-            best_consecutive = best_run
-            best_proximity = proximity
+        proximity  = abs((anchor_date - today).days)
+        starts_1st = 1 if anchor_date.day == 1 else 0
+        key = (best_run, starts_1st, -proximity)
+        if best_key is None or key > best_key:
+            best_key = key
             best_col = c
     return best_col
 
