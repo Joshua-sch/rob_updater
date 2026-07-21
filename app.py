@@ -3,6 +3,7 @@ import pandas as pd
 import openpyxl
 from openpyxl.utils import column_index_from_string
 import io
+import csv
 import re
 import datetime
 import hashlib
@@ -3061,6 +3062,157 @@ def _load_wb_from_drive(svc, hotel_id, hotel_name, wb_type, month_date, data_onl
         return None
 
 
+# ── Ancillary Revenue (Plymouth/Hotel 1620 only, for now) ────────────────────
+# Different shape from ROB/SR/Forecast: one workbook with a tab per month
+# (not a file per hotel per month), and within a month's tab, up to 5 "weeks"
+# sit side by side as column-pairs (WK1=cols B/C ... WK5=cols J/K) rather than
+# as separate sheets. The folder/file are hardcoded rather than resolved
+# through the general multi-hotel machinery since there's currently exactly
+# one of these across all of Drive.
+ANCILLARY_REVENUE_FOLDER_NAME = "M - Ancillary Revenue files PLYMOUTH - TEST"
+ANCILLARY_UPSELL_HEADER_ROW   = 3   # "Name" / "Total number" / "Total Revenue" ...
+ANCILLARY_UPSELL_FIRST_ROW    = 4
+ANCILLARY_WEEK_COLS = {1: (2, 3), 2: (4, 5), 3: (6, 7), 4: (8, 9), 5: (10, 11)}  # week -> (count_col, revenue_col)
+_YELLOW_FILL_RGB = "FFFFFF00"
+
+
+def find_ancillary_revenue_file(service):
+    """Locate Plymouth/Hotel 1620's Ancillary Revenue workbook.
+    Returns (file_id, file_name) or (None, error_str)."""
+    q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    result = service.files().list(
+        q=q, fields="files(id, name)", pageSize=1000,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
+    target = ANCILLARY_REVENUE_FOLDER_NAME.strip().lower()
+    folder_id = next((f["id"] for f in result.get("files", [])
+                       if f["name"].strip().lower() == target), None)
+    if not folder_id:
+        return None, (f"Drive folder '{ANCILLARY_REVENUE_FOLDER_NAME}' not found. "
+                       f"Create it and share it with the service account, then try again.")
+
+    q2 = ("'%s' in parents and trashed = false and "
+          "(mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+          "or mimeType='application/vnd.ms-excel.sheet.macroenabled.12')") % folder_id
+    result2 = service.files().list(
+        q=q2, fields="files(id, name)", pageSize=20,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
+    files = result2.get("files", [])
+    if not files:
+        return None, f"No workbook found in '{ANCILLARY_REVENUE_FOLDER_NAME}'."
+    return files[0]["id"], files[0]["name"]
+
+
+def parse_addon_production_csv(file_bytes: bytes) -> dict:
+    """Parse the wide-format 'Add-on Production' export: one row per
+    upsell item, columns are Name, Total, Revenue, Avg, then a
+    (count, revenue) pair per day, in date order starting from the 1st of
+    whatever month the export covers.
+
+    Returns {normalized_name: [(count, revenue), ...]} — the per-day list
+    is in calendar order starting day 1, so summing any 7-item slice gives
+    that week's totals regardless of which week is being filled.
+
+    Uses Python's built-in csv module rather than pandas — confirmed real
+    case: this export's rows don't all have the same number of trailing
+    empty columns (the two summary rows at the top are shorter than the
+    per-item rows below), and pd.read_csv errors out ("Expected N fields
+    ... saw M") the moment row lengths aren't uniform. The stdlib reader
+    has no such expectation; each row is just whatever fields it has.
+    """
+    text = file_bytes.decode("utf-8-sig")
+    reader = list(csv.reader(io.StringIO(text)))
+    out = {}
+    for row in reader[3:]:   # row 0 = date-range summary, row 1 = blank col header, row 2 = day-header row
+        if not row:
+            continue
+        name = str(row[0] or "").strip()
+        if not name:
+            continue
+        daily = []
+        # Columns 4+ (0-indexed) are (count, revenue) pairs, one per day.
+        c = 4
+        while c + 1 < len(row):
+            count_raw = row[c] if c < len(row) else ""
+            rev_raw   = row[c + 1] if c + 1 < len(row) else ""
+            count = safe_float(count_raw)
+            rev   = safe_float(rev_raw)
+            if count is None and rev is None:
+                break
+            daily.append((count or 0, rev or 0))
+            c += 2
+        out[_normalize_ancillary_name(name)] = daily
+    return out
+
+
+def _normalize_ancillary_name(name: str) -> str:
+    """Loosen an item name for matching between the CSV export and the
+    sheet's own row labels — confirmed real case: the CSV has trailing
+    spaces on several names ('Bottle of House Wine ') that the sheet
+    doesn't, and casing isn't always identical either."""
+    return re.sub(r"\s+", " ", name).strip().upper()
+
+
+def find_next_available_week(ws, header_row=ANCILLARY_UPSELL_HEADER_ROW,
+                              first_data_row=ANCILLARY_UPSELL_FIRST_ROW):
+    """Return the week number (1-5) whose column-pair is marked yellow
+    anywhere in the Upsell table's data rows — i.e. whichever week the
+    sheet itself is flagging as next to fill in. Scans from the header row
+    down to the first row whose col-A label is 'TOTALS'. Returns None if
+    no yellow cells are found (nothing left to fill, or already done)."""
+    last_row = first_data_row
+    for r in range(first_data_row, first_data_row + 30):
+        label = str(ws.cell(r, 1).value or "").strip().upper()
+        if label == "TOTALS":
+            break
+        last_row = r
+    for week, (count_col, rev_col) in ANCILLARY_WEEK_COLS.items():
+        for r in range(first_data_row, last_row + 1):
+            for c in (count_col, rev_col):
+                fill = ws.cell(r, c).fill
+                rgb = fill.fgColor.rgb if fill and fill.fgColor and fill.fgColor.type == "rgb" else None
+                if rgb == _YELLOW_FILL_RGB:
+                    return week
+    return None
+
+
+def build_ancillary_addon_change_plan(daily_by_name: dict, ws, week: int,
+                                       header_row=ANCILLARY_UPSELL_HEADER_ROW,
+                                       first_data_row=ANCILLARY_UPSELL_FIRST_ROW):
+    """Build changes for one week's (count, revenue) columns in the Upsell
+    table, summing the Add-on Production CSV's daily figures for days
+    (week-1)*7+1 .. week*7 of the month against each sheet row's own label
+    (matched via _normalize_ancillary_name — row order isn't assumed to
+    match the CSV's row order).
+    """
+    count_col, rev_col = ANCILLARY_WEEK_COLS[week]
+    day_start = (week - 1) * 7
+    day_end   = day_start + 7  # exclusive
+
+    changes = []
+    r = first_data_row
+    while True:
+        label = str(ws.cell(r, 1).value or "").strip()
+        if not label or label.upper() == "TOTALS":
+            break
+        key = _normalize_ancillary_name(label)
+        daily = daily_by_name.get(key)
+        if daily is not None:
+            slice_ = daily[day_start:day_end]
+            total_count = sum(d[0] for d in slice_)
+            total_rev   = sum(d[1] for d in slice_)
+            changes.append({"row": r, "col": count_col, "label": f"{label} — count", "new_value": total_count})
+            changes.append({"row": r, "col": rev_col,   "label": f"{label} — revenue", "new_value": total_rev})
+        r += 1
+    return changes
+
+
+def apply_ancillary_changes(ws, changes):
+    for ch in changes:
+        ws.cell(ch["row"], ch["col"]).value = ch["new_value"]
+
+
 # ── User accounts (self-serve requests + admin approval) ─────────────────────
 # Streamlit Cloud's filesystem is ephemeral and st.secrets is read-only at
 # runtime, so per-person accounts created through the app can't live in either
@@ -3725,525 +3877,601 @@ if test_mode:
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         )
     
-st.divider()
-# ── Google Drive Update ───────────────────────────────────────────────────────
-col_title, col_month = st.columns([5, 2])
-with col_title:
-    st.header("Weekly Workbook Update")
-with col_month:
-    st.write("")
-    st.write("")
-    st.caption(f"📅 Current month: **{datetime.date.today().strftime('%B %Y')}**")
+tab_weekly, tab_ancillary = st.tabs(["Weekly Workbook Update", "Ancillary Revenue"])
 
-hotels = get_hotels_from_drive()
-hotel_names = [h[0] for h in hotels]
-hotel_id_map = {h[0]: h[1] for h in hotels}
-
-start_new_month = False
-with st.container(border=True):
-    col_h, col_ref, col_w = st.columns([3, 1, 3])
-    with col_h:
-        hotel_sel = st.selectbox("Hotel", hotel_names if hotel_names else ["(no hotels found)"], key="drive_hotel")
-    with col_ref:
+with tab_weekly:
+    st.divider()
+    # ── Google Drive Update ───────────────────────────────────────────────────────
+    col_title, col_month = st.columns([5, 2])
+    with col_title:
+        st.header("Weekly Workbook Update")
+    with col_month:
         st.write("")
-        if st.button("↺", key="refresh_hotels", help="Refresh hotel list"):
-            get_hotels_from_drive.clear()
-            st.rerun()
-    with col_w:
-        wb_sels = st.pills(
-            "Workbooks to update",
-            WORKBOOK_TYPES,
-            selection_mode="multi",
-            default=WORKBOOK_TYPES,
-            key="drive_wb",
-        ) or []
+        st.write("")
+        st.caption(f"📅 Current month: **{datetime.date.today().strftime('%B %Y')}**")
 
-    # Keying these to the selected hotel clears any uploaded file the moment you
-    # switch hotels — one hotel's BOB/R&R CSV should never carry over and get
-    # applied to a different hotel.
-    drive_csv = st.file_uploader("CSV — Business on the Books", type=["csv", "xlsx"], key=f"drive_csv_{hotel_sel}", width=500)
-    drive_rate_csv = None
-    if "Strategy Report" in (wb_sels or []):
-        drive_rate_csv = st.file_uploader("CSV — Rates & Restrictions", type=["csv"], key=f"drive_rate_csv_{hotel_sel}", width=500)
-    drive_npu_compare_csv = None
-    if "ROB" in (wb_sels or []) and "margaritaville" in hotel_sel.lower():
-        drive_npu_compare_csv = st.file_uploader(
-            "Occupancy Statistics — with unpicked group revenue included",
-            type=["xlsx"], key=f"drive_npu_compare_{hotel_sel}", width=500)
+    hotels = get_hotels_from_drive()
+    hotel_names = [h[0] for h in hotels]
+    hotel_id_map = {h[0]: h[1] for h in hotels}
 
-    opt_col1, opt_col2 = st.columns(2)
-    forecast_next_month = False
-    if "Forecast" in (wb_sels or []):
-        with opt_col1:
-            forecast_next_month = st.checkbox("Include next month's Forecast", key="drive_fcst_next")
-    with opt_col2:
-        start_new_month = st.checkbox("Set up new month", key="drive_new_month")
-if start_new_month:
+    start_new_month = False
     with st.container(border=True):
-        today         = datetime.date.today()
-        cur_month_dt  = today.replace(day=1)
-        prev_month_dt = (cur_month_dt - datetime.timedelta(days=1)).replace(day=1)
-        next_month_dt = (cur_month_dt + datetime.timedelta(days=32)).replace(day=1)
-        month_options = {
-            prev_month_dt.strftime("%B %Y"): prev_month_dt,
-            cur_month_dt.strftime("%B %Y"):  cur_month_dt,
-            next_month_dt.strftime("%B %Y"): next_month_dt,
-        }
-        month_labels = list(month_options.keys())
-        sel_month_label = st.selectbox("Month to set up", month_labels,
-                                        index=month_labels.index(cur_month_dt.strftime("%B %Y")),
-                                        key="setup_month_sel")
-        setup_month_dt  = month_options[sel_month_label]
-        month_kw        = setup_month_dt.strftime("%b%Y").upper()
+        col_h, col_ref, col_w = st.columns([3, 1, 3])
+        with col_h:
+            hotel_sel = st.selectbox("Hotel", hotel_names if hotel_names else ["(no hotels found)"], key="drive_hotel")
+        with col_ref:
+            st.write("")
+            if st.button("↺", key="refresh_hotels", help="Refresh hotel list"):
+                get_hotels_from_drive.clear()
+                st.rerun()
+        with col_w:
+            wb_sels = st.pills(
+                "Workbooks to update",
+                WORKBOOK_TYPES,
+                selection_mode="multi",
+                default=WORKBOOK_TYPES,
+                key="drive_wb",
+            ) or []
 
-        rob_col, sr_col = st.columns(2)
+        # Keying these to the selected hotel clears any uploaded file the moment you
+        # switch hotels — one hotel's BOB/R&R CSV should never carry over and get
+        # applied to a different hotel.
+        drive_csv = st.file_uploader("CSV — Business on the Books", type=["csv", "xlsx"], key=f"drive_csv_{hotel_sel}", width=500)
+        drive_rate_csv = None
+        if "Strategy Report" in (wb_sels or []):
+            drive_rate_csv = st.file_uploader("CSV — Rates & Restrictions", type=["csv"], key=f"drive_rate_csv_{hotel_sel}", width=500)
+        drive_npu_compare_csv = None
+        if "ROB" in (wb_sels or []) and "margaritaville" in hotel_sel.lower():
+            drive_npu_compare_csv = st.file_uploader(
+                "Occupancy Statistics — with unpicked group revenue included",
+                type=["xlsx"], key=f"drive_npu_compare_{hotel_sel}", width=500)
 
-        # ── ROB setup ──────────────────────────────────────────────────────────
-        with rob_col:
-            st.markdown("**ROB**")
-            if st.button("Set Up New ROB", key="btn_setup_rob", type="primary", use_container_width=True):
-                try:
-                    svc         = get_drive_service()
-                    hotel_id_nm = hotel_id_map.get(hotel_sel, "")
-                    with st.spinner("Setting up ROB — this may take a moment..."):
-                        rob_name, rob_err = setup_new_rob_month(svc, hotel_id_nm, hotel_sel, setup_month_dt)
-                    if rob_err and not rob_name:
-                        if "storageQuotaExceeded" in str(rob_err):
-                            _, master_name = find_rob_master(svc, hotel_id_nm)
-                            rob_suffix = hotel_sel.upper()
-                            if master_name and "ROB" in master_name.upper():
-                                after = master_name[master_name.upper().find("ROB") + 3:].strip()
-                                after = after.replace(".xlsx","").replace(".xlsm","").replace(".XLSX","").replace(".XLSM","").strip()
-                                if after:
-                                    rob_suffix = after
-                            ext = ".xlsm" if master_name and master_name.lower().endswith(".xlsm") else ".xlsx"
-                            suggested_name = f"{month_kw} ROB {rob_suffix}{ext}"
-                            st.warning(
-                                f"Auto-copy requires a Shared Drive. Do this in Google Drive first:\n\n"
-                                f"1. Right-click **{master_name or 'the ROB master'}** → *Make a copy*\n"
-                                f"2. Rename to: **`{suggested_name}`**\n"
-                                f"3. Move into the **{month_kw}** folder\n\n"
-                                f"Then click **Set Up New ROB** again."
-                            )
+        opt_col1, opt_col2 = st.columns(2)
+        forecast_next_month = False
+        if "Forecast" in (wb_sels or []):
+            with opt_col1:
+                forecast_next_month = st.checkbox("Include next month's Forecast", key="drive_fcst_next")
+        with opt_col2:
+            start_new_month = st.checkbox("Set up new month", key="drive_new_month")
+    if start_new_month:
+        with st.container(border=True):
+            today         = datetime.date.today()
+            cur_month_dt  = today.replace(day=1)
+            prev_month_dt = (cur_month_dt - datetime.timedelta(days=1)).replace(day=1)
+            next_month_dt = (cur_month_dt + datetime.timedelta(days=32)).replace(day=1)
+            month_options = {
+                prev_month_dt.strftime("%B %Y"): prev_month_dt,
+                cur_month_dt.strftime("%B %Y"):  cur_month_dt,
+                next_month_dt.strftime("%B %Y"): next_month_dt,
+            }
+            month_labels = list(month_options.keys())
+            sel_month_label = st.selectbox("Month to set up", month_labels,
+                                            index=month_labels.index(cur_month_dt.strftime("%B %Y")),
+                                            key="setup_month_sel")
+            setup_month_dt  = month_options[sel_month_label]
+            month_kw        = setup_month_dt.strftime("%b%Y").upper()
+
+            rob_col, sr_col = st.columns(2)
+
+            # ── ROB setup ──────────────────────────────────────────────────────────
+            with rob_col:
+                st.markdown("**ROB**")
+                if st.button("Set Up New ROB", key="btn_setup_rob", type="primary", use_container_width=True):
+                    try:
+                        svc         = get_drive_service()
+                        hotel_id_nm = hotel_id_map.get(hotel_sel, "")
+                        with st.spinner("Setting up ROB — this may take a moment..."):
+                            rob_name, rob_err = setup_new_rob_month(svc, hotel_id_nm, hotel_sel, setup_month_dt)
+                        if rob_err and not rob_name:
+                            if "storageQuotaExceeded" in str(rob_err):
+                                _, master_name = find_rob_master(svc, hotel_id_nm)
+                                rob_suffix = hotel_sel.upper()
+                                if master_name and "ROB" in master_name.upper():
+                                    after = master_name[master_name.upper().find("ROB") + 3:].strip()
+                                    after = after.replace(".xlsx","").replace(".xlsm","").replace(".XLSX","").replace(".XLSM","").strip()
+                                    if after:
+                                        rob_suffix = after
+                                ext = ".xlsm" if master_name and master_name.lower().endswith(".xlsm") else ".xlsx"
+                                suggested_name = f"{month_kw} ROB {rob_suffix}{ext}"
+                                st.warning(
+                                    f"Auto-copy requires a Shared Drive. Do this in Google Drive first:\n\n"
+                                    f"1. Right-click **{master_name or 'the ROB master'}** → *Make a copy*\n"
+                                    f"2. Rename to: **`{suggested_name}`**\n"
+                                    f"3. Move into the **{month_kw}** folder\n\n"
+                                    f"Then click **Set Up New ROB** again."
+                                )
+                            else:
+                                st.error(f"ROB setup error: {rob_err}")
                         else:
-                            st.error(f"ROB setup error: {rob_err}")
-                    else:
-                        if rob_err:
-                            st.warning(rob_err)
-                        st.success(f"**{rob_name}** ready for {setup_month_dt.strftime('%B %Y')}.")
-                except Exception as e:
-                    st.error(f"ROB setup error: {e}")
+                            if rob_err:
+                                st.warning(rob_err)
+                            st.success(f"**{rob_name}** ready for {setup_month_dt.strftime('%B %Y')}.")
+                    except Exception as e:
+                        st.error(f"ROB setup error: {e}")
 
-        # ── Strategy Report setup ──────────────────────────────────────────────
-        with sr_col:
-            st.markdown("**Strategy Report**")
-            if st.button("Set Up New SR", key="btn_setup_new_wb", type="primary", use_container_width=True):
-                try:
-                    svc         = get_drive_service()
-                    hotel_id_nm = hotel_id_map.get(hotel_sel, "")
+            # ── Strategy Report setup ──────────────────────────────────────────────
+            with sr_col:
+                st.markdown("**Strategy Report**")
+                if st.button("Set Up New SR", key="btn_setup_new_wb", type="primary", use_container_width=True):
+                    try:
+                        svc         = get_drive_service()
+                        hotel_id_nm = hotel_id_map.get(hotel_sel, "")
 
-                    # Step 1 — ensure the file exists; skip copy if it's already there
-                    is_fresh_copy = False
-                    with st.spinner("Step 1 / 3 — locating or creating workbook..."):
-                        existing, find_err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
-                                                              "Strategy Report", month_date=setup_month_dt)
-                        if existing:
-                            st.info(f"Found existing file: **{existing[1]}** — skipping copy.")
-                        else:
-                            is_fresh_copy = True
-                            created_name, create_err = setup_new_sr_month(svc, hotel_id_nm, hotel_sel, setup_month_dt)
-                            if create_err:
-                                master_id, master_name = find_sr_master(svc, hotel_id_nm)
-                                hotel_suffix = ""
-                                if master_name and "STRATEGY" in master_name.upper():
-                                    hotel_suffix = master_name[master_name.upper().find("STRATEGY") + len("STRATEGY"):].strip().replace(".xlsx","").replace(".XLSX","").strip()
-                                suggested_name = f"{month_kw} STRATEGY {hotel_suffix}.xlsx".strip()
-                                if "storageQuotaExceeded" in str(create_err):
-                                    st.warning(
-                                        f"Auto-copy requires a Shared Drive. Do this in Google Drive first:\n\n"
-                                        f"1. Right-click **{master_name or 'the SR master'}** → *Make a copy*\n"
-                                        f"2. Rename to: **`{suggested_name}`**\n"
-                                        f"3. Move into the **{month_kw}** folder\n\n"
-                                        f"Then click **Set Up New SR** again."
-                                    )
-                                else:
-                                    st.error(f"Could not create workbook: {create_err}")
+                        # Step 1 — ensure the file exists; skip copy if it's already there
+                        is_fresh_copy = False
+                        with st.spinner("Step 1 / 3 — locating or creating workbook..."):
+                            existing, find_err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
+                                                                  "Strategy Report", month_date=setup_month_dt)
+                            if existing:
+                                st.info(f"Found existing file: **{existing[1]}** — skipping copy.")
+                            else:
+                                is_fresh_copy = True
+                                created_name, create_err = setup_new_sr_month(svc, hotel_id_nm, hotel_sel, setup_month_dt)
+                                if create_err:
+                                    master_id, master_name = find_sr_master(svc, hotel_id_nm)
+                                    hotel_suffix = ""
+                                    if master_name and "STRATEGY" in master_name.upper():
+                                        hotel_suffix = master_name[master_name.upper().find("STRATEGY") + len("STRATEGY"):].strip().replace(".xlsx","").replace(".XLSX","").strip()
+                                    suggested_name = f"{month_kw} STRATEGY {hotel_suffix}.xlsx".strip()
+                                    if "storageQuotaExceeded" in str(create_err):
+                                        st.warning(
+                                            f"Auto-copy requires a Shared Drive. Do this in Google Drive first:\n\n"
+                                            f"1. Right-click **{master_name or 'the SR master'}** → *Make a copy*\n"
+                                            f"2. Rename to: **`{suggested_name}`**\n"
+                                            f"3. Move into the **{month_kw}** folder\n\n"
+                                            f"Then click **Set Up New SR** again."
+                                        )
+                                    else:
+                                        st.error(f"Could not create workbook: {create_err}")
+                                    st.stop()
+
+                        # Step 2 — load reference workbooks into memory
+                        with st.spinner("Step 2 / 3 — loading reference workbooks..."):
+                            prev_month_dt    = (setup_month_dt - datetime.timedelta(days=1)).replace(day=1)
+                            ly_month_dt      = setup_month_dt.replace(year=setup_month_dt.year - 1)
+                            prev_month_sr_wb = _load_wb_from_drive(svc, hotel_id_nm, hotel_sel, "Strategy Report", prev_month_dt, data_only=False)
+                            ly_sr_wb         = _load_wb_from_drive(svc, hotel_id_nm, hotel_sel, "Strategy Report", ly_month_dt)
+                        st.info(f"Prev month ({prev_month_dt.strftime('%b %Y')}): {'✓' if prev_month_sr_wb else '✗ not found'}")
+                        st.info(f"Last year  ({ly_month_dt.strftime('%b %Y')}): {'✓' if ly_sr_wb else '✗ not found'}")
+
+                        # Step 3 — populate all 5 weeks
+                        with st.spinner("Step 3 / 3 — populating all weeks..."):
+                            result, err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
+                                                                 "Strategy Report", month_date=setup_month_dt)
+                            if err:
+                                st.error(f"Cannot open new workbook: {err}")
                                 st.stop()
+                            file_id, file_name = result
+                            wb_bytes = drive_download(svc, file_id)
+                            original_bytes = wb_bytes
+                            wb       = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
+                            if is_fresh_copy:
+                                clear_tab_colors(wb, STRATEGY_SHEETS)
+                            restructure_sr_dates(wb, setup_month_dt)
+                            first_ws = wb[STRATEGY_SHEETS[0]] if STRATEGY_SHEETS[0] in wb.sheetnames else None
+                            num_rows = _count_sheet_data_rows(first_ws) if first_ws else 365
+                            full_scope_start = setup_month_dt
+                            full_scope_end   = setup_month_dt + datetime.timedelta(days=max(0, num_rows - 1))
+                            total_written = 0
+                            for sheet_name in STRATEGY_SHEETS:
+                                if sheet_name not in wb.sheetnames:
+                                    continue
+                                changes = build_strategy_change_plan(None, wb, sheet_name,
+                                                                      prev_month_wb=prev_month_sr_wb,
+                                                                      ly_wb=ly_sr_wb,
+                                                                      scope_start=full_scope_start,
+                                                                      scope_end=full_scope_end)
+                                apply_strategy_changes(wb, sheet_name, changes)
+                                total_written += len([c for c in changes if not c.get("skip_reason")])
+                            strip_tables(wb)
+                            out = io.BytesIO()
+                            wb.save(out)
+                            drive_upload(svc, file_id, out.getvalue(), file_name)
+                            st.session_state["setup_undo"] = {
+                                "file_id":   file_id,
+                                "file_name": file_name,
+                                "bytes":     original_bytes,
+                            }
 
-                    # Step 2 — load reference workbooks into memory
-                    with st.spinner("Step 2 / 3 — loading reference workbooks..."):
-                        prev_month_dt    = (setup_month_dt - datetime.timedelta(days=1)).replace(day=1)
-                        ly_month_dt      = setup_month_dt.replace(year=setup_month_dt.year - 1)
-                        prev_month_sr_wb = _load_wb_from_drive(svc, hotel_id_nm, hotel_sel, "Strategy Report", prev_month_dt, data_only=False)
-                        ly_sr_wb         = _load_wb_from_drive(svc, hotel_id_nm, hotel_sel, "Strategy Report", ly_month_dt)
-                    st.info(f"Prev month ({prev_month_dt.strftime('%b %Y')}): {'✓' if prev_month_sr_wb else '✗ not found'}")
-                    st.info(f"Last year  ({ly_month_dt.strftime('%b %Y')}): {'✓' if ly_sr_wb else '✗ not found'}")
+                        st.success(
+                            f"**{file_name}** is set up for {setup_month_dt.strftime('%B %Y')}. "
+                            f"Populated **{total_written}** cells across all weeks."
+                        )
+                    except Exception as e:
+                        st.error(f"Setup error: {e}")
 
-                    # Step 3 — populate all 5 weeks
-                    with st.spinner("Step 3 / 3 — populating all weeks..."):
-                        result, err = resolve_drive_workbook(svc, hotel_id_nm, hotel_sel,
-                                                             "Strategy Report", month_date=setup_month_dt)
-                        if err:
-                            st.error(f"Cannot open new workbook: {err}")
-                            st.stop()
-                        file_id, file_name = result
-                        wb_bytes = drive_download(svc, file_id)
-                        original_bytes = wb_bytes
-                        wb       = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
-                        if is_fresh_copy:
-                            clear_tab_colors(wb, STRATEGY_SHEETS)
-                        restructure_sr_dates(wb, setup_month_dt)
-                        first_ws = wb[STRATEGY_SHEETS[0]] if STRATEGY_SHEETS[0] in wb.sheetnames else None
-                        num_rows = _count_sheet_data_rows(first_ws) if first_ws else 365
-                        full_scope_start = setup_month_dt
-                        full_scope_end   = setup_month_dt + datetime.timedelta(days=max(0, num_rows - 1))
-                        total_written = 0
-                        for sheet_name in STRATEGY_SHEETS:
-                            if sheet_name not in wb.sheetnames:
-                                continue
-                            changes = build_strategy_change_plan(None, wb, sheet_name,
-                                                                  prev_month_wb=prev_month_sr_wb,
-                                                                  ly_wb=ly_sr_wb,
-                                                                  scope_start=full_scope_start,
-                                                                  scope_end=full_scope_end)
-                            apply_strategy_changes(wb, sheet_name, changes)
-                            total_written += len([c for c in changes if not c.get("skip_reason")])
-                        strip_tables(wb)
-                        out = io.BytesIO()
-                        wb.save(out)
-                        drive_upload(svc, file_id, out.getvalue(), file_name)
-                        st.session_state["setup_undo"] = {
-                            "file_id":   file_id,
-                            "file_name": file_name,
-                            "bytes":     original_bytes,
-                        }
-
-                    st.success(
-                        f"**{file_name}** is set up for {setup_month_dt.strftime('%B %Y')}. "
-                        f"Populated **{total_written}** cells across all weeks."
-                    )
-                except Exception as e:
-                    st.error(f"Setup error: {e}")
-
-        # Reset button — shown after a successful setup
-        if "setup_undo" in st.session_state:
-            st.divider()
-            reset_col, _ = st.columns([2, 5])
-            with reset_col:
-             if st.button("↩ Reset Workbook to Original", key="setup_reset", type="secondary", use_container_width=True):
-                 try:
-                     info = st.session_state["setup_undo"]
-                     with st.spinner("Restoring original workbook..."):
-                         get_drive_service()
-                         drive_upload(get_drive_service(), info["file_id"], info["bytes"], info["file_name"])
-                     del st.session_state["setup_undo"]
-                     st.success(f"**{info['file_name']}** restored to original state.")
-                 except Exception as e:
-                     st.error(f"Reset error: {e}")
+            # Reset button — shown after a successful setup
+            if "setup_undo" in st.session_state:
+                st.divider()
+                reset_col, _ = st.columns([2, 5])
+                with reset_col:
+                 if st.button("↩ Reset Workbook to Original", key="setup_reset", type="secondary", use_container_width=True):
+                     try:
+                         info = st.session_state["setup_undo"]
+                         with st.spinner("Restoring original workbook..."):
+                             get_drive_service()
+                             drive_upload(get_drive_service(), info["file_id"], info["bytes"], info["file_name"])
+                         del st.session_state["setup_undo"]
+                         st.success(f"**{info['file_name']}** restored to original state.")
+                     except Exception as e:
+                         st.error(f"Reset error: {e}")
 
 
 
 
-def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_next_month=False, npu_compare_df=None):
-    today = datetime.date.today()
-    current_month = today.replace(day=1)
-    all_plans = {}
+    def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_next_month=False, npu_compare_df=None):
+        today = datetime.date.today()
+        current_month = today.replace(day=1)
+        all_plans = {}
 
-    grp_npu_rev_override = compute_grp_npu_rev_override(df, npu_compare_df)
+        grp_npu_rev_override = compute_grp_npu_rev_override(df, npu_compare_df)
 
-    # Pre-load reference workbooks into memory once — used for cross-sheet lookups
-    prev_month_sr_wb = None
-    ly_sr_wb         = None
-    if "Strategy Report" in wb_sels:
-        prev_month_dt = (current_month - datetime.timedelta(days=1)).replace(day=1)
-        ly_month_dt   = current_month.replace(year=current_month.year - 1)
-        prev_month_sr_wb = _load_wb_from_drive(svc, hotel_id, hotel_sel, "Strategy Report", prev_month_dt, data_only=False)
-        ly_sr_wb         = _load_wb_from_drive(svc, hotel_id, hotel_sel, "Strategy Report", ly_month_dt)
-        # Comp Set LY / OTB LY Trans / GRP LY etc. all come from ly_sr_wb — if it's
-        # not found, those fields silently produce nothing (no warning previously),
-        # which looked like "dates transferred but no text" with no explanation why.
-        st.info(f"SR reference workbooks — Prev month ({prev_month_dt.strftime('%b %Y')}): "
-                f"{'✓ found' if prev_month_sr_wb else '✗ NOT FOUND — OTB Lst Wek will be blank'} | "
-                f"Last year ({ly_month_dt.strftime('%b %Y')}): "
-                f"{'✓ found' if ly_sr_wb else '✗ NOT FOUND — all LY columns (incl. Comp Set LY text) will be blank'}")
+        # Pre-load reference workbooks into memory once — used for cross-sheet lookups
+        prev_month_sr_wb = None
+        ly_sr_wb         = None
+        if "Strategy Report" in wb_sels:
+            prev_month_dt = (current_month - datetime.timedelta(days=1)).replace(day=1)
+            ly_month_dt   = current_month.replace(year=current_month.year - 1)
+            prev_month_sr_wb = _load_wb_from_drive(svc, hotel_id, hotel_sel, "Strategy Report", prev_month_dt, data_only=False)
+            ly_sr_wb         = _load_wb_from_drive(svc, hotel_id, hotel_sel, "Strategy Report", ly_month_dt)
+            # Comp Set LY / OTB LY Trans / GRP LY etc. all come from ly_sr_wb — if it's
+            # not found, those fields silently produce nothing (no warning previously),
+            # which looked like "dates transferred but no text" with no explanation why.
+            st.info(f"SR reference workbooks — Prev month ({prev_month_dt.strftime('%b %Y')}): "
+                    f"{'✓ found' if prev_month_sr_wb else '✗ NOT FOUND — OTB Lst Wek will be blank'} | "
+                    f"Last year ({ly_month_dt.strftime('%b %Y')}): "
+                    f"{'✓ found' if ly_sr_wb else '✗ NOT FOUND — all LY columns (incl. Comp Set LY text) will be blank'}")
 
-    for wb_type in wb_sels:
-        result, err = resolve_drive_workbook(svc, hotel_id, hotel_sel, wb_type)
-        if err:
-            st.error(f"{wb_type}: {err}")
-            continue
-        file_id, file_name = result
-        wb_bytes = drive_download(svc, file_id)
-        wb       = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
-        if wb_type == "ROB":
-            avail    = [s for s in ROB_SHEETS if s in wb.sheetnames]
-            auto     = first_uncolored_sheet(wb, avail)
-            sheet    = auto or avail[0]
-            changes  = build_rob_change_plan(df, wb[sheet], grp_npu_rev_override=grp_npu_rev_override)
-            warnings = []
-        elif wb_type == "Strategy Report":
-            avail    = [s for s in STRATEGY_SHEETS if s in wb.sheetnames]
-            auto     = first_undone_strategy_sheet(wb, avail)
-            sheet    = auto or avail[0]
-            date_row_map_debug = build_date_row_map(wb, prefer_sheet=sheet)
-            st.info(f"SR: **{file_name}** (id: `{file_id}`) → sheet **{sheet}** | "
-                    f"date rows mapped: {len(date_row_map_debug)} | "
-                    f"date range: {min(date_row_map_debug) if date_row_map_debug else 'none'} – {max(date_row_map_debug) if date_row_map_debug else 'none'}")
-            if "WKONE" in wb.sheetnames:
-                from openpyxl.utils import get_column_letter
-                wkone_ws = wb["WKONE"]
-                wkone_col = detect_date_column(wkone_ws, wb=wb)
-                raw_r5  = wkone_ws.cell(5, wkone_col).value
-                raw_r10 = wkone_ws.cell(10, wkone_col).value
-                st.info(f"WKONE date column detected: **{get_column_letter(wkone_col)}** | "
-                        f"raw value at row 5: `{raw_r5!r}` | raw value at row 10: `{raw_r10!r}`")
-                # Column C specifically — the active sheet's date formulas
-                # reference WKONE!C directly, which may not be the same
-                # column detect_date_column just picked as WKONE's own
-                # "best" column above. Need this exact value to settle
-                # whether the remaining offset originates in WKONE's own
-                # column C data, not wherever else WKONE's calendar lives.
-                raw_c5  = wkone_ws.cell(5, 3).value
-                raw_c6  = wkone_ws.cell(6, 3).value
-                st.info(f"WKONE column C specifically — raw row 5: `{raw_c5!r}` | raw row 6: `{raw_c6!r}`")
-            # Strict, no-fallback view of the ACTIVE sheet's own date column —
-            # this is what actually gates whether CSV data can be written at
-            # all (own_date_row_map inside build_strategy_change_plan uses
-            # the exact same fallback_to_wkone=False call). Always shown so
-            # one run's output settles both "wrong day" and "no data" at once
-            # instead of needing another round of screenshots.
-            own_debug = build_date_row_map(wb, prefer_sheet=sheet, fallback_to_wkone=False)
-            own_col = detect_date_column(wb[sheet], wb=wb)
-            from openpyxl.utils import get_column_letter as _gcl
-            st.info(f"**{sheet}**'s own date column (strict, no WKONE fallback): "
-                    f"col **{_gcl(own_col)}** | rows mapped: {len(own_debug)} | "
-                    f"range: {min(own_debug) if own_debug else 'NONE — this is why no CSV data would write'} "
-                    f"– {max(own_debug) if own_debug else ''} | "
-                    f"raw row5: `{wb[sheet].cell(5, own_col).value!r}` | "
-                    f"raw row10: `{wb[sheet].cell(10, own_col).value!r}`")
-            if df is not None:
-                sample_dates = [str(df.iloc[i, 0]) for i in range(min(5, len(df)))]
-                bob_daily = sum(1 for _, r in df.iterrows() if classify_row(str(r[0]).strip())[0] == "daily")
-                st.info(f"BOB CSV: {len(df)} rows | daily rows matched: {bob_daily} | first 5 col-0 values: {sample_dates}")
+        for wb_type in wb_sels:
+            result, err = resolve_drive_workbook(svc, hotel_id, hotel_sel, wb_type)
+            if err:
+                st.error(f"{wb_type}: {err}")
+                continue
+            file_id, file_name = result
+            wb_bytes = drive_download(svc, file_id)
+            wb       = openpyxl.load_workbook(io.BytesIO(wb_bytes), data_only=False)
+            if wb_type == "ROB":
+                avail    = [s for s in ROB_SHEETS if s in wb.sheetnames]
+                auto     = first_uncolored_sheet(wb, avail)
+                sheet    = auto or avail[0]
+                changes  = build_rob_change_plan(df, wb[sheet], grp_npu_rev_override=grp_npu_rev_override)
+                warnings = []
+            elif wb_type == "Strategy Report":
+                avail    = [s for s in STRATEGY_SHEETS if s in wb.sheetnames]
+                auto     = first_undone_strategy_sheet(wb, avail)
+                sheet    = auto or avail[0]
+                date_row_map_debug = build_date_row_map(wb, prefer_sheet=sheet)
+                st.info(f"SR: **{file_name}** (id: `{file_id}`) → sheet **{sheet}** | "
+                        f"date rows mapped: {len(date_row_map_debug)} | "
+                        f"date range: {min(date_row_map_debug) if date_row_map_debug else 'none'} – {max(date_row_map_debug) if date_row_map_debug else 'none'}")
+                if "WKONE" in wb.sheetnames:
+                    from openpyxl.utils import get_column_letter
+                    wkone_ws = wb["WKONE"]
+                    wkone_col = detect_date_column(wkone_ws, wb=wb)
+                    raw_r5  = wkone_ws.cell(5, wkone_col).value
+                    raw_r10 = wkone_ws.cell(10, wkone_col).value
+                    st.info(f"WKONE date column detected: **{get_column_letter(wkone_col)}** | "
+                            f"raw value at row 5: `{raw_r5!r}` | raw value at row 10: `{raw_r10!r}`")
+                    # Column C specifically — the active sheet's date formulas
+                    # reference WKONE!C directly, which may not be the same
+                    # column detect_date_column just picked as WKONE's own
+                    # "best" column above. Need this exact value to settle
+                    # whether the remaining offset originates in WKONE's own
+                    # column C data, not wherever else WKONE's calendar lives.
+                    raw_c5  = wkone_ws.cell(5, 3).value
+                    raw_c6  = wkone_ws.cell(6, 3).value
+                    st.info(f"WKONE column C specifically — raw row 5: `{raw_c5!r}` | raw row 6: `{raw_c6!r}`")
+                # Strict, no-fallback view of the ACTIVE sheet's own date column —
+                # this is what actually gates whether CSV data can be written at
+                # all (own_date_row_map inside build_strategy_change_plan uses
+                # the exact same fallback_to_wkone=False call). Always shown so
+                # one run's output settles both "wrong day" and "no data" at once
+                # instead of needing another round of screenshots.
+                own_debug = build_date_row_map(wb, prefer_sheet=sheet, fallback_to_wkone=False)
+                own_col = detect_date_column(wb[sheet], wb=wb)
+                from openpyxl.utils import get_column_letter as _gcl
+                st.info(f"**{sheet}**'s own date column (strict, no WKONE fallback): "
+                        f"col **{_gcl(own_col)}** | rows mapped: {len(own_debug)} | "
+                        f"range: {min(own_debug) if own_debug else 'NONE — this is why no CSV data would write'} "
+                        f"– {max(own_debug) if own_debug else ''} | "
+                        f"raw row5: `{wb[sheet].cell(5, own_col).value!r}` | "
+                        f"raw row10: `{wb[sheet].cell(10, own_col).value!r}`")
+                if df is not None:
+                    sample_dates = [str(df.iloc[i, 0]) for i in range(min(5, len(df)))]
+                    bob_daily = sum(1 for _, r in df.iterrows() if classify_row(str(r[0]).strip())[0] == "daily")
+                    st.info(f"BOB CSV: {len(df)} rows | daily rows matched: {bob_daily} | first 5 col-0 values: {sample_dates}")
+                else:
+                    st.warning("BOB CSV: df is None — no CSV uploaded or parse failed")
+                changes  = build_strategy_change_plan(df, wb, sheet,
+                                                       prev_month_wb=prev_month_sr_wb,
+                                                       ly_wb=ly_sr_wb)
+                warnings = []
+                if rate_df is not None:
+                    rate_changes, rate_warnings = build_rates_change_plan(rate_df, wb, sheet)
+                    changes  += rate_changes
+                    warnings += rate_warnings
+            else:  # Forecast — current month (no Month Ending Forecast fill here)
+                avail    = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
+                auto     = first_unhighlighted_forecast_sheet(wb, avail)
+                sheet    = auto or avail[0]
+                changes, warnings = build_forecast_change_plan(df, wb[sheet])
+            all_plans[wb_type] = {
+                "file_id":   file_id,
+                "file_name": file_name,
+                "wb_bytes":  wb_bytes,
+                "sheet":     sheet,
+                "changes":   changes,
+                "warnings":  warnings,
+            }
+
+        # Next-month Forecast: only when checkbox is ticked
+        if "Forecast" in wb_sels and forecast_next_month:
+            next_month_dt = (datetime.date.today().replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+            nm_result, nm_err = resolve_drive_workbook(svc, hotel_id, hotel_sel, "Forecast", month_date=next_month_dt)
+            if nm_err:
+                # Workbook not found — auto-create from master
+                st.info(f"Next month Forecast not found — creating from master...")
+                created_name, setup_err = setup_new_forecast_month(svc, hotel_id, hotel_sel, next_month_dt)
+                if setup_err and not created_name:
+                    st.warning(f"Next month Forecast: {setup_err}")
+                else:
+                    if setup_err:
+                        st.warning(setup_err)
+                    else:
+                        st.success(f"Created **{created_name}** for {next_month_dt.strftime('%B %Y')}.")
+                    nm_result, nm_err = resolve_drive_workbook(svc, hotel_id, hotel_sel, "Forecast", month_date=next_month_dt)
+                    if nm_err:
+                        st.warning(f"Still could not find next month Forecast after creation: {nm_err}")
             else:
-                st.warning("BOB CSV: df is None — no CSV uploaded or parse failed")
-            changes  = build_strategy_change_plan(df, wb, sheet,
-                                                   prev_month_wb=prev_month_sr_wb,
-                                                   ly_wb=ly_sr_wb)
-            warnings = []
-            if rate_df is not None:
-                rate_changes, rate_warnings = build_rates_change_plan(rate_df, wb, sheet)
-                changes  += rate_changes
-                warnings += rate_warnings
-        else:  # Forecast — current month (no Month Ending Forecast fill here)
-            avail    = [s for s in FORECAST_SHEETS if s in wb.sheetnames]
-            auto     = first_unhighlighted_forecast_sheet(wb, avail)
-            sheet    = auto or avail[0]
-            changes, warnings = build_forecast_change_plan(df, wb[sheet])
-        all_plans[wb_type] = {
-            "file_id":   file_id,
-            "file_name": file_name,
-            "wb_bytes":  wb_bytes,
-            "sheet":     sheet,
-            "changes":   changes,
-            "warnings":  warnings,
+                nm_file_id, nm_file_name = nm_result
+                nm_bytes = drive_download(svc, nm_file_id)
+                nm_wb    = openpyxl.load_workbook(io.BytesIO(nm_bytes), data_only=False)
+                nm_avail = [s for s in FORECAST_SHEETS if s in nm_wb.sheetnames]
+                nm_auto  = first_unhighlighted_forecast_sheet(nm_wb, nm_avail)
+                nm_sheet = nm_auto or nm_avail[0]
+                nm_changes, nm_warnings = build_next_month_forecast_plan(df, nm_wb[nm_sheet])
+                # Month Ending Forecast table — fill Budget + LY from next month's ROB
+                nm_is_wk1 = (nm_sheet == FORECAST_SHEETS[0])
+                if nm_is_wk1:
+                    nm_rob_result, _ = resolve_drive_workbook(svc, hotel_id, hotel_sel, "ROB",
+                                                               month_date=next_month_dt)
+                    if nm_rob_result:
+                        nm_rob_wb = openpyxl.load_workbook(
+                            io.BytesIO(drive_download(svc, nm_rob_result[0])), data_only=True)
+                        extra, extra_warn = build_forecast_change_plan(
+                            df, nm_wb[nm_sheet], rob_wb=nm_rob_wb, is_wk1=True)
+                        # Only keep the Month Ending Forecast entries from extra
+                        nm_changes += [c for c in extra if "Month End Forecast" in c.get("label", "")]
+                        nm_warnings += extra_warn
+                all_plans["Forecast (next month)"] = {
+                    "file_id":   nm_file_id,
+                    "file_name": nm_file_name,
+                    "wb_bytes":  nm_bytes,
+                    "sheet":     nm_sheet,
+                    "changes":   nm_changes,
+                    "warnings":  nm_warnings,
+                }
+
+        return all_plans
+
+
+    def _snapshot_changes(wb, sheet_name, changes):
+        """Return {(sheet, row, col): original_value} for every cell in the change plan."""
+        ws = wb[sheet_name]
+        return {
+            (sheet_name, ch["row"], ch["col"]): ws.cell(ch["row"], ch["col"]).value
+            for ch in changes
+            if not ch.get("skip_reason")
         }
 
-    # Next-month Forecast: only when checkbox is ticked
-    if "Forecast" in wb_sels and forecast_next_month:
-        next_month_dt = (datetime.date.today().replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
-        nm_result, nm_err = resolve_drive_workbook(svc, hotel_id, hotel_sel, "Forecast", month_date=next_month_dt)
-        if nm_err:
-            # Workbook not found — auto-create from master
-            st.info(f"Next month Forecast not found — creating from master...")
-            created_name, setup_err = setup_new_forecast_month(svc, hotel_id, hotel_sel, next_month_dt)
-            if setup_err and not created_name:
-                st.warning(f"Next month Forecast: {setup_err}")
-            else:
-                if setup_err:
-                    st.warning(setup_err)
-                else:
-                    st.success(f"Created **{created_name}** for {next_month_dt.strftime('%B %Y')}.")
-                nm_result, nm_err = resolve_drive_workbook(svc, hotel_id, hotel_sel, "Forecast", month_date=next_month_dt)
-                if nm_err:
-                    st.warning(f"Still could not find next month Forecast after creation: {nm_err}")
-        else:
-            nm_file_id, nm_file_name = nm_result
-            nm_bytes = drive_download(svc, nm_file_id)
-            nm_wb    = openpyxl.load_workbook(io.BytesIO(nm_bytes), data_only=False)
-            nm_avail = [s for s in FORECAST_SHEETS if s in nm_wb.sheetnames]
-            nm_auto  = first_unhighlighted_forecast_sheet(nm_wb, nm_avail)
-            nm_sheet = nm_auto or nm_avail[0]
-            nm_changes, nm_warnings = build_next_month_forecast_plan(df, nm_wb[nm_sheet])
-            # Month Ending Forecast table — fill Budget + LY from next month's ROB
-            nm_is_wk1 = (nm_sheet == FORECAST_SHEETS[0])
-            if nm_is_wk1:
-                nm_rob_result, _ = resolve_drive_workbook(svc, hotel_id, hotel_sel, "ROB",
-                                                           month_date=next_month_dt)
-                if nm_rob_result:
-                    nm_rob_wb = openpyxl.load_workbook(
-                        io.BytesIO(drive_download(svc, nm_rob_result[0])), data_only=True)
-                    extra, extra_warn = build_forecast_change_plan(
-                        df, nm_wb[nm_sheet], rob_wb=nm_rob_wb, is_wk1=True)
-                    # Only keep the Month Ending Forecast entries from extra
-                    nm_changes += [c for c in extra if "Month End Forecast" in c.get("label", "")]
-                    nm_warnings += extra_warn
-            all_plans["Forecast (next month)"] = {
-                "file_id":   nm_file_id,
-                "file_name": nm_file_name,
-                "wb_bytes":  nm_bytes,
-                "sheet":     nm_sheet,
-                "changes":   nm_changes,
-                "warnings":  nm_warnings,
-            }
 
-    return all_plans
-
-
-def _snapshot_changes(wb, sheet_name, changes):
-    """Return {(sheet, row, col): original_value} for every cell in the change plan."""
-    ws = wb[sheet_name]
-    return {
-        (sheet_name, ch["row"], ch["col"]): ws.cell(ch["row"], ch["col"]).value
-        for ch in changes
-        if not ch.get("skip_reason")
-    }
-
-
-def apply_and_upload(svc, all_plans):
-    saved, errors = [], []
-    undo_snapshot = {}  # cumulative snapshot across all workbooks
-    for wb_type, plan in all_plans.items():
-        try:
-            wb_apply = openpyxl.load_workbook(io.BytesIO(plan["wb_bytes"]), data_only=False)
-            # Snapshot originals BEFORE writing
-            snap = _snapshot_changes(wb_apply, plan["sheet"], plan["changes"])
-            undo_snapshot[wb_type] = {
-                "file_id":   plan["file_id"],
-                "file_name": plan["file_name"],
-                "wb_bytes":  plan["wb_bytes"],   # clean pre-write bytes
-                "sheet":     plan["sheet"],
-                "cells":     snap,
-            }
-            if wb_type == "ROB":
-                apply_rob_changes(wb_apply, plan["sheet"], plan["changes"])
-            elif wb_type == "Strategy Report":
-                apply_strategy_changes(wb_apply, plan["sheet"], plan["changes"])
-            else:
-                apply_forecast_changes(wb_apply, plan["sheet"], plan["changes"])
-            color_tab_done(wb_apply, plan["sheet"])
-            strip_tables(wb_apply)
-            out = io.BytesIO()
-            wb_apply.save(out)
-            drive_upload(svc, plan["file_id"], out.getvalue(), plan["file_name"])
-            saved.append(plan["file_name"])
-        except Exception as e:
-            errors.append(f"{wb_type}: {e}")
-    if saved:
-        st.session_state["undo_snapshot"] = undo_snapshot
-    return saved, errors
-
-
-def undo_all_changes(svc):
-    """Restore every snapshotted cell to its original value and re-upload."""
-    snapshot = st.session_state.get("undo_snapshot", {})
-    if not snapshot:
-        return [], ["No snapshot found — nothing to undo."]
-    saved, errors = [], []
-    for wb_type, info in snapshot.items():
-        try:
-            wb = openpyxl.load_workbook(io.BytesIO(info["wb_bytes"]), data_only=False)
-            ws = wb[info["sheet"]]
-            for (sheet, row, col), orig_val in info["cells"].items():
-                ws.cell(row, col).value = orig_val
-            strip_tables(wb)
-            out = io.BytesIO()
-            wb.save(out)
-            drive_upload(svc, info["file_id"], out.getvalue(), info["file_name"])
-            saved.append(info["file_name"])
-        except Exception as e:
-            errors.append(f"{wb_type}: {e}")
-    if saved:
-        del st.session_state["undo_snapshot"]
-    return saved, errors
-
-
-ready = drive_csv and wb_sels
-
-if test_mode:
-    # ── Test mode: preview first, then confirm ────────────────────────────────
-    if ready and st.button("Preview Changes", key="drive_preview"):
-        try:
-            svc     = get_drive_service()
-            df      = parse_bob_source(drive_csv) if drive_csv else None
-            rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
-            npu_compare_df = parse_bob_source(drive_npu_compare_csv) if drive_npu_compare_csv else None
-            st.session_state["drive_plans"]     = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month, npu_compare_df)
-            st.session_state["drive_hotel_sel"] = hotel_sel
-        except Exception as e:
-            st.error(f"Drive error: {e}")
-
-    if "drive_plans" in st.session_state:
-        all_plans = st.session_state["drive_plans"]
+    def apply_and_upload(svc, all_plans):
+        saved, errors = [], []
+        undo_snapshot = {}  # cumulative snapshot across all workbooks
         for wb_type, plan in all_plans.items():
-            st.subheader(wb_type)
-            st.caption(f"File: **{plan['file_name']}** — Tab: **{plan['sheet']}**")
-            for w in plan["warnings"]:
-                st.warning(w)
-            ch = plan["changes"]
-            will_write = [c for c in ch if not c["skip_reason"]]
-            skipped    = [c for c in ch if c["skip_reason"]]
-            c1, c2 = st.columns(2)
-            c1.metric("Cells to update", len(will_write))
-            c2.metric("Skipped",         len(skipped))
-            st.dataframe([{
-                "Label":  c["label"],
-                "Row":    c["row"],
-                "Col":    c["col"],
-                "Value":  c["new_value"],
-                "Status": "✅ will write" if not c["skip_reason"] else f"⚠️ skip ({c['skip_reason']})",
-            } for c in ch], use_container_width=True)
-
-        if st.button("Confirm and Save All to Google Drive", key="drive_apply"):
             try:
-                saved, errors = apply_and_upload(get_drive_service(), all_plans)
+                wb_apply = openpyxl.load_workbook(io.BytesIO(plan["wb_bytes"]), data_only=False)
+                # Snapshot originals BEFORE writing
+                snap = _snapshot_changes(wb_apply, plan["sheet"], plan["changes"])
+                undo_snapshot[wb_type] = {
+                    "file_id":   plan["file_id"],
+                    "file_name": plan["file_name"],
+                    "wb_bytes":  plan["wb_bytes"],   # clean pre-write bytes
+                    "sheet":     plan["sheet"],
+                    "cells":     snap,
+                }
+                if wb_type == "ROB":
+                    apply_rob_changes(wb_apply, plan["sheet"], plan["changes"])
+                elif wb_type == "Strategy Report":
+                    apply_strategy_changes(wb_apply, plan["sheet"], plan["changes"])
+                else:
+                    apply_forecast_changes(wb_apply, plan["sheet"], plan["changes"])
+                color_tab_done(wb_apply, plan["sheet"])
+                strip_tables(wb_apply)
+                out = io.BytesIO()
+                wb_apply.save(out)
+                drive_upload(svc, plan["file_id"], out.getvalue(), plan["file_name"])
+                saved.append(plan["file_name"])
+            except Exception as e:
+                errors.append(f"{wb_type}: {e}")
+        if saved:
+            st.session_state["undo_snapshot"] = undo_snapshot
+        return saved, errors
+
+
+    def undo_all_changes(svc):
+        """Restore every snapshotted cell to its original value and re-upload."""
+        snapshot = st.session_state.get("undo_snapshot", {})
+        if not snapshot:
+            return [], ["No snapshot found — nothing to undo."]
+        saved, errors = [], []
+        for wb_type, info in snapshot.items():
+            try:
+                wb = openpyxl.load_workbook(io.BytesIO(info["wb_bytes"]), data_only=False)
+                ws = wb[info["sheet"]]
+                for (sheet, row, col), orig_val in info["cells"].items():
+                    ws.cell(row, col).value = orig_val
+                strip_tables(wb)
+                out = io.BytesIO()
+                wb.save(out)
+                drive_upload(svc, info["file_id"], out.getvalue(), info["file_name"])
+                saved.append(info["file_name"])
+            except Exception as e:
+                errors.append(f"{wb_type}: {e}")
+        if saved:
+            del st.session_state["undo_snapshot"]
+        return saved, errors
+
+
+    ready = drive_csv and wb_sels
+
+    if test_mode:
+        # ── Test mode: preview first, then confirm ────────────────────────────────
+        if ready and st.button("Preview Changes", key="drive_preview"):
+            try:
+                svc     = get_drive_service()
+                df      = parse_bob_source(drive_csv) if drive_csv else None
+                rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
+                npu_compare_df = parse_bob_source(drive_npu_compare_csv) if drive_npu_compare_csv else None
+                st.session_state["drive_plans"]     = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month, npu_compare_df)
+                st.session_state["drive_hotel_sel"] = hotel_sel
+            except Exception as e:
+                st.error(f"Drive error: {e}")
+
+        if "drive_plans" in st.session_state:
+            all_plans = st.session_state["drive_plans"]
+            for wb_type, plan in all_plans.items():
+                st.subheader(wb_type)
+                st.caption(f"File: **{plan['file_name']}** — Tab: **{plan['sheet']}**")
+                for w in plan["warnings"]:
+                    st.warning(w)
+                ch = plan["changes"]
+                will_write = [c for c in ch if not c["skip_reason"]]
+                skipped    = [c for c in ch if c["skip_reason"]]
+                c1, c2 = st.columns(2)
+                c1.metric("Cells to update", len(will_write))
+                c2.metric("Skipped",         len(skipped))
+                st.dataframe([{
+                    "Label":  c["label"],
+                    "Row":    c["row"],
+                    "Col":    c["col"],
+                    "Value":  c["new_value"],
+                    "Status": "✅ will write" if not c["skip_reason"] else f"⚠️ skip ({c['skip_reason']})",
+                } for c in ch], use_container_width=True)
+
+            if st.button("Confirm and Save All to Google Drive", key="drive_apply"):
+                try:
+                    saved, errors = apply_and_upload(get_drive_service(), all_plans)
+                    for name in saved:
+                        st.success(f"Saved **{name}** to Google Drive.")
+                    for err in errors:
+                        st.error(err)
+                except Exception as e:
+                    st.error(f"Drive error: {e}")
+    else:
+        # ── Normal mode: one click ────────────────────────────────────────────────
+        if ready and st.button("Upload Data to Workbooks", key="drive_go", type="primary"):
+            try:
+                svc     = get_drive_service()
+                df      = parse_bob_source(drive_csv) if drive_csv else None
+                rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
+                npu_compare_df = parse_bob_source(drive_npu_compare_csv) if drive_npu_compare_csv else None
+                with st.spinner("Updating workbooks in Google Drive..."):
+                    all_plans       = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month, npu_compare_df)
+                    saved, errors   = apply_and_upload(svc, all_plans)
                 for name in saved:
                     st.success(f"Saved **{name}** to Google Drive.")
                 for err in errors:
                     st.error(err)
             except Exception as e:
                 st.error(f"Drive error: {e}")
-else:
-    # ── Normal mode: one click ────────────────────────────────────────────────
-    if ready and st.button("Upload Data to Workbooks", key="drive_go", type="primary"):
-        try:
-            svc     = get_drive_service()
-            df      = parse_bob_source(drive_csv) if drive_csv else None
-            rate_df = parse_rate_csv(drive_rate_csv.read()) if drive_rate_csv else None
-            npu_compare_df = parse_bob_source(drive_npu_compare_csv) if drive_npu_compare_csv else None
-            with st.spinner("Updating workbooks in Google Drive..."):
-                all_plans       = build_all_plans(svc, hotel_sel, hotel_id_map.get(hotel_sel, ""), wb_sels, df, rate_df, forecast_next_month, npu_compare_df)
-                saved, errors   = apply_and_upload(svc, all_plans)
-            for name in saved:
-                st.success(f"Saved **{name}** to Google Drive.")
-            for err in errors:
-                st.error(err)
-        except Exception as e:
-            st.error(f"Drive error: {e}")
 
-# ── Undo button (shown whenever a snapshot exists) ────────────────────────────
-if "undo_snapshot" in st.session_state:
-    st.divider()
-    undo_col, _ = st.columns([2, 5])
-    with undo_col:
-        if st.button("↩ Undo Last Upload", key="undo_all", type="secondary", use_container_width=True):
+    # ── Undo button (shown whenever a snapshot exists) ────────────────────────────
+    if "undo_snapshot" in st.session_state:
+        st.divider()
+        undo_col, _ = st.columns([2, 5])
+        with undo_col:
+            if st.button("↩ Undo Last Upload", key="undo_all", type="secondary", use_container_width=True):
+                try:
+                    with st.spinner("Restoring original values..."):
+                        saved, errors = undo_all_changes(get_drive_service())
+                    for name in saved:
+                        st.success(f"Restored **{name}** to original state.")
+                    for err in errors:
+                        st.error(err)
+                except Exception as e:
+                    st.error(f"Undo error: {e}")
+
+
+with tab_ancillary:
+    st.caption("Fills in the next available week (auto-detected from the sheet's own "
+               "yellow highlighting) in the Upsell Overview table.")
+
+    ar_month = st.selectbox(
+        "Month tab", ["FEB", "MAR", "APR", "MAY", "JUN", "JUL"],
+        index=["FEB", "MAR", "APR", "MAY", "JUN", "JUL"].index(
+            datetime.date.today().strftime("%b").upper()
+        ) if datetime.date.today().strftime("%b").upper() in
+             ["FEB", "MAR", "APR", "MAY", "JUN", "JUL"] else 5,
+        key="ar_month",
+    )
+    ar_addon_file = st.file_uploader(
+        "Add-on Production report (CSV)", type=["csv"], key="ar_addon_csv")
+    ar_upsell_file = st.file_uploader(
+        "Upsell Report (format not wired up yet — feeds the room-upgrade rows, "
+        "coming soon)", type=["csv", "xlsx"], key="ar_upsell_csv", disabled=True)
+
+    if ar_addon_file and st.button("Preview Ancillary Revenue Changes", key="ar_preview"):
+        try:
+            svc = get_drive_service()
+            ar_file_id, ar_file_name = find_ancillary_revenue_file(svc)
+            if not ar_file_id:
+                st.error(ar_file_name)  # error string in the name slot
+            else:
+                ar_bytes = drive_download(svc, ar_file_id)
+                ar_wb = openpyxl.load_workbook(io.BytesIO(ar_bytes), data_only=False)
+                if ar_month not in ar_wb.sheetnames:
+                    st.error(f"No '{ar_month}' tab found in {ar_file_name}.")
+                else:
+                    ar_ws = ar_wb[ar_month]
+                    ar_week = find_next_available_week(ar_ws)
+                    if ar_week is None:
+                        st.warning("No yellow-highlighted week found — every week may already be filled in.")
+                    else:
+                        daily_by_name = parse_addon_production_csv(ar_addon_file.read())
+                        ar_changes = build_ancillary_addon_change_plan(daily_by_name, ar_ws, ar_week)
+                        st.session_state["ar_file_id"]    = ar_file_id
+                        st.session_state["ar_file_name"]  = ar_file_name
+                        st.session_state["ar_bytes"]      = ar_bytes
+                        st.session_state["ar_month_sel"]  = ar_month
+                        st.session_state["ar_week_sel"]   = ar_week
+                        st.session_state["ar_changes"]    = ar_changes
+                        st.success(f"Detected **Week {ar_week}** as next available in **{ar_month}**.")
+        except Exception as e:
+            st.error(f"Preview error: {e}")
+
+    if "ar_changes" in st.session_state:
+        ar_changes = st.session_state["ar_changes"]
+        st.write(f"**{len(ar_changes)}** cells will be written to "
+                 f"**{st.session_state['ar_file_name']}** → {st.session_state['ar_month_sel']} "
+                 f"→ Week {st.session_state['ar_week_sel']}:")
+        st.dataframe(
+            [{"Cell": f"{openpyxl.utils.get_column_letter(c['col'])}{c['row']}",
+              "Field": c["label"], "New value": c["new_value"]} for c in ar_changes],
+            use_container_width=True,
+        )
+        if st.button("Apply to Google Drive", key="ar_apply", type="primary"):
             try:
-                with st.spinner("Restoring original values..."):
-                    saved, errors = undo_all_changes(get_drive_service())
-                for name in saved:
-                    st.success(f"Restored **{name}** to original state.")
-                for err in errors:
-                    st.error(err)
+                svc = get_drive_service()
+                ar_wb = openpyxl.load_workbook(io.BytesIO(st.session_state["ar_bytes"]), data_only=False)
+                ar_ws = ar_wb[st.session_state["ar_month_sel"]]
+                apply_ancillary_changes(ar_ws, st.session_state["ar_changes"])
+                out = io.BytesIO()
+                ar_wb.save(out)
+                drive_upload(svc, st.session_state["ar_file_id"], out.getvalue(), st.session_state["ar_file_name"])
+                st.success(f"**{st.session_state['ar_file_name']}** updated.")
+                for key in ["ar_changes", "ar_bytes", "ar_file_id", "ar_file_name", "ar_month_sel", "ar_week_sel"]:
+                    del st.session_state[key]
             except Exception as e:
-                st.error(f"Undo error: {e}")
+                st.error(f"Apply error: {e}")
 
