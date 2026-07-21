@@ -754,7 +754,7 @@ def get_ly_sr_data(service, hotel_id, hotel_name, current_month, sheet_name):
     return out
 
 
-def build_date_row_map(wb, prefer_sheet=None):
+def build_date_row_map(wb, prefer_sheet=None, fallback_to_wkone=True):
     """Build {date: row_number} using auto-detected date column, trying
     prefer_sheet (the tab actually being updated) first and falling back to
     WKONE. When subsequent rows contain formulas (=C5+1 style), extrapolates
@@ -766,9 +766,15 @@ def build_date_row_map(wb, prefer_sheet=None):
     column. Always reading WKONE broke every week's update, even weeks
     whose own calendar was perfectly fine, because their own date column
     was never even looked at.
+
+    Set fallback_to_wkone=False when the caller is about to WRITE
+    current-cycle data and prefer_sheet's own column must be the sole
+    source of truth — no cross-sheet fallback allowed, since writing based
+    on a different sheet's calendar than the one being edited risks
+    silently landing data on the wrong row if the two ever drift apart.
     """
     candidates = [prefer_sheet] if prefer_sheet and prefer_sheet in wb.sheetnames else []
-    if "WKONE" in wb.sheetnames:
+    if fallback_to_wkone and "WKONE" in wb.sheetnames:
         candidates.append("WKONE")
 
     for sheet_name in candidates:
@@ -997,6 +1003,10 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
                 })
 
     # ── CSV-sourced TY columns (only when BOB uploaded) ──────────────────────
+    # Uses ONLY this sheet's own date column (no WKONE fallback) — this is
+    # current-cycle data being written, and it must always be placed
+    # against the calendar actually printed on the sheet being edited.
+    own_date_row_map = build_date_row_map(wb, prefer_sheet=sheet_name, fallback_to_wkone=False)
     for _, row in (df.iterrows() if df is not None else []):
         date_str = str(row[0]).strip() if row[0] else ""
         kind, info = classify_row(date_str)
@@ -1005,9 +1015,9 @@ def build_strategy_change_plan(df, wb, sheet_name, prev_month_wb=None, ly_wb=Non
         d = info
         if d < scope_start or d > scope_end:
             continue
-        if d not in date_row_map:
+        if d not in own_date_row_map:
             continue
-        excel_row = date_row_map[d]
+        excel_row = own_date_row_map[d]
         for field, (csv_col, label) in STRATEGY_CSV_COLS.items():
             excel_col = col_map.get(field)
             if excel_col is None:
