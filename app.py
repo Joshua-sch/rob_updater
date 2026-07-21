@@ -856,6 +856,7 @@ def build_date_row_map(wb, prefer_sheet=None, fallback_to_wkone=True):
         date_col = detect_date_column(ws, wb=wb)
         mapping = {}
         anchor_date = None
+        anchor_row  = None
         # Scan at least 400 rows regardless of this sheet's own max_row —
         # confirmed real case: a week tab whose date column is entirely
         # cross-sheet formulas referencing WKONE can have its own "used
@@ -877,12 +878,26 @@ def build_date_row_map(wb, prefer_sheet=None, fallback_to_wkone=True):
                 # mirror WKONE's calendar this way by design, so this must
                 # actually follow the reference, not just assume +1 day.
                 d = _resolve_formula_date(wb, sheet_name, val)
-                if d is None:
+                if d is None and anchor_row is not None:
+                    # Unreadable cell, but the row-to-date relationship is a
+                    # fixed, already-proven pattern (row N is always N minus
+                    # anchor_row days after the anchor) — confirmed real
+                    # case: Crowne Pointe's date formula chain was only ever
+                    # filled down partway, leaving later rows genuinely
+                    # blank even though the CSV and WKONE both have a full
+                    # year of real data. Extrapolate instead of stopping.
+                    d = anchor_date + datetime.timedelta(days=row_num - anchor_row)
+                elif d is None:
                     continue
+            elif anchor_row is not None:
+                # Truly blank cell past the established anchor — same
+                # extrapolation as above.
+                d = anchor_date + datetime.timedelta(days=row_num - anchor_row)
             else:
                 continue
             if anchor_date is None:
                 anchor_date = d
+                anchor_row  = row_num
             mapping[d] = row_num
         if mapping:
             # Auto-correct a stale year instead of requiring the sheet's
