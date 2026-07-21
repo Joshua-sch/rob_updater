@@ -605,6 +605,13 @@ def detect_date_column(ws):
     Counting formula rows that follow a literal anchor as continuing the
     sequence (without evaluating them) fixes this the same way
     build_date_row_map already trusts that pattern.
+
+    Scans 60 rows (not just the first 10) — a 10-row window is too easily
+    fooled by a sheet whose real calendar column doesn't fully establish
+    itself that close to the top, or where some other left-side column
+    coincidentally looks date-like in just that narrow band. A wider
+    window gives every genuine candidate room to prove real consecutive
+    length before scoring, at negligible extra cost.
     """
     today = datetime.date.today()
     best_col, best_consecutive, best_proximity = 3, -1, None  # fallback to col 3
@@ -614,7 +621,7 @@ def detect_date_column(ws):
         count = 0
         best_run = 0
         run_anchor = None
-        for r in range(5, min(ws.max_row + 1, 15)):
+        for r in range(5, min(ws.max_row + 1, 65)):
             v = ws.cell(r, c).value
             if isinstance(v, datetime.datetime):
                 d = v.date()
@@ -3897,6 +3904,21 @@ def build_all_plans(svc, hotel_sel, hotel_id, wb_sels, df, rate_df, forecast_nex
                 raw_r10 = wkone_ws.cell(10, wkone_col).value
                 st.info(f"WKONE date column detected: **{get_column_letter(wkone_col)}** | "
                         f"raw value at row 5: `{raw_r5!r}` | raw value at row 10: `{raw_r10!r}`")
+            # Strict, no-fallback view of the ACTIVE sheet's own date column —
+            # this is what actually gates whether CSV data can be written at
+            # all (own_date_row_map inside build_strategy_change_plan uses
+            # the exact same fallback_to_wkone=False call). Always shown so
+            # one run's output settles both "wrong day" and "no data" at once
+            # instead of needing another round of screenshots.
+            own_debug = build_date_row_map(wb, prefer_sheet=sheet, fallback_to_wkone=False)
+            own_col = detect_date_column(wb[sheet])
+            from openpyxl.utils import get_column_letter as _gcl
+            st.info(f"**{sheet}**'s own date column (strict, no WKONE fallback): "
+                    f"col **{_gcl(own_col)}** | rows mapped: {len(own_debug)} | "
+                    f"range: {min(own_debug) if own_debug else 'NONE — this is why no CSV data would write'} "
+                    f"– {max(own_debug) if own_debug else ''} | "
+                    f"raw row5: `{wb[sheet].cell(5, own_col).value!r}` | "
+                    f"raw row10: `{wb[sheet].cell(10, own_col).value!r}`")
             if df is not None:
                 sample_dates = [str(df.iloc[i, 0]) for i in range(min(5, len(df)))]
                 bob_daily = sum(1 for _, r in df.iterrows() if classify_row(str(r[0]).strip())[0] == "daily")
